@@ -1,0 +1,32 @@
+# Secrets and local environment
+train/.env
+dev/.env
+license.dat
+
+# Training outputs
+train/log/
+train/backup_model/
+train/_inspect_ckpt/
+dev/log/
+
+# Local backups and snapshots
+code_snapshots/
+code/agent_ppo/backup/
+
+# Model artifacts
+**/ckpt/
+*.pkl
+
+# Python cache
+**/__pycache__/
+*.pyc
+*.pyo
+
+# IDE files
+.idea/
+.vscode/
+
+# Internal notes
+SKILLS.md
+baseline_structure_analysis.md
+competition_summary.md
