@@ -52,6 +52,8 @@ class Algorithm:
         advantage = torch.stack([s.advantage for s in list_sample_data]).to(self.device)
         reward = torch.stack([s.reward for s in list_sample_data]).to(self.device)
 
+        advantage = self._normalize_advantage(advantage)
+
         self.model.set_train_mode()
         self.optimizer.zero_grad()
 
@@ -86,12 +88,15 @@ class Algorithm:
             results["value_loss"] = round(info["value_loss"], 4)
             results["policy_loss"] = round(info["policy_loss"], 4)
             results["entropy_loss"] = round(info["entropy_loss"], 4)
-            results["reward"] = round(reward.mean().item(), 4)
+            results["batch_reward"] = round(reward.mean().item(), 4)
 
             self.logger.info(
-                f"policy_loss: {results['policy_loss']}, "
-                f"value_loss: {results['value_loss']}, "
-                f"entropy_loss: {results['entropy_loss']}"
+                "[TRAIN_METRICS] "
+                f"train_step:{self.train_step} total_loss:{results['total_loss']:.4f} "
+                f"policy_loss:{results['policy_loss']:.4f} "
+                f"value_loss:{results['value_loss']:.4f} "
+                f"entropy_loss:{results['entropy_loss']:.4f} "
+                f"batch_reward:{results['batch_reward']:.4f}"
             )
             if self.monitor:
                 self.monitor.put_data({os.getpid(): results})
@@ -148,6 +153,17 @@ class Algorithm:
             "policy_loss": policy_loss.item(),
             "entropy_loss": entropy_loss.item(),
         }
+
+    def _normalize_advantage(self, advantage):
+        """Normalize advantages within current training batch.
+
+        对当前训练 batch 的优势函数做标准化，降低奖励尺度波动带来的更新抖动。
+        """
+        adv = advantage.float()
+        adv_mean = adv.mean()
+        adv_std = adv.std(unbiased=False)
+        normalized_adv = (adv - adv_mean) / adv_std.clamp_min(1e-8)
+        return normalized_adv
 
     def _masked_softmax(self, logits, legal_action):
         """Apply legal action mask to logits before computing softmax.

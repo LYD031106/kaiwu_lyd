@@ -83,9 +83,58 @@ class Preprocessor:
     OPPOSITE_ACTIONS = (4, 5, 6, 7, 0, 1, 2, 3)
     DELTA_TO_ACTION = {delta: idx for idx, delta in enumerate(ACTION_DELTAS)}
 
-    def __init__(self):
+    TRAINING_STAGE_REWARD_PROFILES = {
+        "early": {
+            "base_step_cost_scale": 0.90,
+            "clean_gain_scale": 0.70,
+            "explore_gain_scale": 0.65,
+            "idle_penalty_scale": 0.75,
+            "charge_gain_scale": 1.35,
+            "return_progress_scale": 1.25,
+            "return_risk_penalty_scale": 1.30,
+            "cycle_quality_scale": 0.75,
+            "first_charge_deadline_scale": 1.25,
+        },
+        "middle": {
+            "base_step_cost_scale": 1.00,
+            "clean_gain_scale": 1.00,
+            "explore_gain_scale": 1.00,
+            "idle_penalty_scale": 1.00,
+            "charge_gain_scale": 1.00,
+            "return_progress_scale": 1.00,
+            "return_risk_penalty_scale": 1.00,
+            "cycle_quality_scale": 1.00,
+            "first_charge_deadline_scale": 1.00,
+        },
+        "late": {
+            "base_step_cost_scale": 1.10,
+            "clean_gain_scale": 1.18,
+            "explore_gain_scale": 1.10,
+            "idle_penalty_scale": 1.25,
+            "charge_gain_scale": 0.88,
+            "return_progress_scale": 0.92,
+            "return_risk_penalty_scale": 0.92,
+            "cycle_quality_scale": 1.15,
+            "first_charge_deadline_scale": 0.85,
+        },
+    }
+
+    def __init__(self, training_stage_name="early", training_stage_id=0):
         """初始化预处理器，并建立一套全新的局内状态。"""
+        self.training_stage_name = self._normalize_training_stage_name(training_stage_name)
+        self.training_stage_id = int(training_stage_id)
+        self.training_stage_profile = self._build_training_stage_profile(self.training_stage_name)
         self.reset()
+
+    def _normalize_training_stage_name(self, stage_name):
+        name = str(stage_name or "early").strip().lower()
+        if name not in self.TRAINING_STAGE_REWARD_PROFILES:
+            return "early"
+        return name
+
+    def _build_training_stage_profile(self, stage_name):
+        normalized_name = self._normalize_training_stage_name(stage_name)
+        return dict(self.TRAINING_STAGE_REWARD_PROFILES[normalized_name])
 
     def reset(self):
         """
@@ -2540,6 +2589,8 @@ class Preprocessor:
 
         return {
             "pos": self.cur_pos,
+            "training_stage_name": self.training_stage_name,
+            "training_stage_id": int(self.training_stage_id),
             "remaining_charge": int(self.remaining_charge),
             "charge_count": int(self.charge_count),
             "npc_count": int(self.npc_count),
@@ -2680,47 +2731,48 @@ class Preprocessor:
         if self.last_charger_route_dist < 200.0 and self.charger_route_dist < 200.0:
             route_progress = float(self.last_charger_route_dist - self.charger_route_dist)
         stall_steps = int(guidance.get("charge_stall_steps", 0))
+        profile = self.training_stage_profile
 
         # 统一的轻微生存成本，避免策略通过无意义拖时长白拿零奖励。
-        reward = -0.0025
+        reward = -0.0025 * profile["base_step_cost_scale"]
 
         # 当已经进入回桩/低电量阶段时，弱化清扫和探索奖励，避免局部收益继续把策略拉离充电目标。
         clean_scale = 0.22 if low_battery else (0.35 if should_return else 1.0)
         explore_scale = 0.12 if low_battery else (0.25 if should_return else 1.0)
-        reward += 0.08 * cleaned_this_step * clean_scale
-        reward += 0.0035 * min(new_explored_cells, 6) * explore_scale
+        reward += 0.08 * cleaned_this_step * clean_scale * profile["clean_gain_scale"]
+        reward += 0.0035 * min(new_explored_cells, 6) * explore_scale * profile["explore_gain_scale"]
 
         # 对高访问次数且没有任何产出的停留做惩罚，降低来回抖动和空转。
         if cleaned_this_step == 0 and new_explored_cells == 0 and current_visit >= 6:
-            reward -= 0.003 * min(current_visit - 5, 6)
+            reward -= 0.003 * min(current_visit - 5, 6) * profile["idle_penalty_scale"]
 
         # 充电成功一定要比普通局部收益高很多，否则策略会更倾向“继续赌几步清扫”。
         if charged_this_step:
-            reward += 1.30
+            reward += 1.30 * profile["charge_gain_scale"]
             if first_charge_success:
-                reward += 1.10
+                reward += 1.10 * profile["charge_gain_scale"]
                 if self.step_no <= 220:
-                    reward += 0.20
+                    reward += 0.20 * profile["charge_gain_scale"]
                 elif self.step_no <= 320:
-                    reward += 0.10
+                    reward += 0.10 * profile["charge_gain_scale"]
 
             # 如果一轮充电前几乎没有拿到任何有效收益，说明策略可能在刷“低价值小循环”，
             # 这里稍微压一下，避免模型学成“刚出门就回桩”。
             cycle_explore_gain = int(self.prev_charge_cycle_explore_gain)
             cycle_clean_gain = int(self.prev_charge_cycle_clean_gain)
             if cycle_explore_gain <= 2 and cycle_clean_gain <= 4:
-                reward -= 0.32
+                reward -= 0.32 * profile["cycle_quality_scale"]
             elif cycle_explore_gain <= 6 and cycle_clean_gain <= 10:
-                reward -= 0.14
+                reward -= 0.14 * profile["cycle_quality_scale"]
             elif cycle_explore_gain >= 24 or cycle_clean_gain >= 30:
-                reward += 0.12
+                reward += 0.12 * profile["cycle_quality_scale"]
 
         # 进入回桩 / 低电量阶段后，奖励核心变成“是否真的在向充电桩推进”。
         if should_return or low_battery:
-            reward -= 0.004 if low_battery else 0.0015
+            reward -= (0.004 if low_battery else 0.0015) * profile["return_risk_penalty_scale"]
             if route_progress is not None:
-                progress_scale = 0.040 if dock_mode else 0.036
-                regress_scale = 0.060 if dock_mode else 0.055
+                progress_scale = (0.040 if dock_mode else 0.036) * profile["return_progress_scale"]
+                regress_scale = (0.060 if dock_mode else 0.055) * profile["return_risk_penalty_scale"]
                 if route_progress > 0:
                     reward += progress_scale * min(route_progress, 2.0)
                 elif route_progress < 0:
@@ -2730,50 +2782,50 @@ class Preprocessor:
                 # 让首充回桩更容易成为 PPO 早期学到的强信号。
                 if first_charge_phase:
                     if route_progress > 0:
-                        reward += 0.012 * min(route_progress, 2.0)
+                        reward += 0.012 * min(route_progress, 2.0) * profile["return_progress_scale"]
                     elif route_progress < 0:
-                        reward += 0.018 * max(route_progress, -2.0)
+                        reward += 0.018 * max(route_progress, -2.0) * profile["return_risk_penalty_scale"]
 
             if critical_battery:
-                reward -= 0.035
+                reward -= 0.035 * profile["return_risk_penalty_scale"]
 
             if not guidance.get("path_found", False):
-                reward -= 0.006
+                reward -= 0.006 * profile["return_risk_penalty_scale"]
             elif not guidance.get("route_reliable", False):
-                reward -= 0.0035
+                reward -= 0.0035 * profile["return_risk_penalty_scale"]
 
             if stall_steps >= 2:
-                reward -= 0.010 * min(stall_steps, 6)
+                reward -= 0.010 * min(stall_steps, 6) * profile["return_risk_penalty_scale"]
                 if dock_mode:
-                    reward -= 0.005 * min(stall_steps, 4)
+                    reward -= 0.005 * min(stall_steps, 4) * profile["return_risk_penalty_scale"]
 
             if dock_mode and target_dist is not None and int(target_dist) <= 1 and not charged_this_step:
-                reward -= 0.055
+                reward -= 0.055 * profile["return_risk_penalty_scale"]
             elif dock_mode and target_dist is not None and int(target_dist) <= 2:
                 if route_progress is not None and route_progress <= 0:
-                    reward -= 0.015
+                    reward -= 0.015 * profile["return_risk_penalty_scale"]
 
         # 当已经非常接近回桩阈值却还没进入回桩模式时，也给一个轻微警告，
         # 让策略逐步学会“不要把安全余量耗到极限再回”。
         elif battery_margin is not None and battery_margin <= activation_buffer + 4 and not charged_this_step:
-            reward -= 0.006
+            reward -= 0.006 * profile["return_risk_penalty_scale"]
 
         # 首充阶段额外强调“及时回去并充上”，这是当前最优先提升的训练目标。
         if first_charge_phase:
             if first_charge_budget_margin is not None:
                 if not should_return and first_charge_budget_margin <= 0:
-                    reward -= 0.060
+                    reward -= 0.060 * profile["first_charge_deadline_scale"]
                 elif not should_return and first_charge_budget_margin <= 6:
-                    reward -= 0.024
+                    reward -= 0.024 * profile["first_charge_deadline_scale"]
                 elif should_return and first_charge_budget_margin < -6:
-                    reward -= 0.018
+                    reward -= 0.018 * profile["first_charge_deadline_scale"]
 
             if self.step_no >= 160:
-                reward -= 0.004
+                reward -= 0.004 * profile["first_charge_deadline_scale"]
             if self.step_no >= 220:
-                reward -= 0.010
+                reward -= 0.010 * profile["first_charge_deadline_scale"]
             if self.step_no >= 300:
-                reward -= 0.016
+                reward -= 0.016 * profile["first_charge_deadline_scale"]
 
         # 保留简单的 NPC 风险 shaping，避免为了清扫或回充直接撞上 NPC。
         if self.nearest_npc_dist <= 1:

@@ -61,7 +61,12 @@ class Agent(BaseAgent):
         self.logger = logger
         self.monitor = monitor
         self.algorithm = Algorithm(self.model, self.optimizer, self.device, self.logger, self.monitor)
-        self.preprocessor = Preprocessor()
+        self.current_training_stage_name = "early"
+        self.current_training_stage_id = 0
+        self.preprocessor = Preprocessor(
+            training_stage_name=self.current_training_stage_name,
+            training_stage_id=self.current_training_stage_id,
+        )
         self.last_action = -1
         self.last_reward = 0.0
         self.last_action_debug = self._empty_action_debug()
@@ -74,10 +79,33 @@ class Agent(BaseAgent):
 
         每一局都重新创建 `Preprocessor`，避免上局的地图记忆、访问计数、回充状态等信息串到新局。
         """
-        self.preprocessor = Preprocessor()
+        self.preprocessor = Preprocessor(
+            training_stage_name=self.current_training_stage_name,
+            training_stage_id=self.current_training_stage_id,
+        )
         self.last_action = -1
         self.last_reward = 0.0
         self.last_action_debug = self._empty_action_debug()
+
+    def set_training_stage(self, stage_name, stage_id=None):
+        """
+        更新当前 actor 使用的训练阶段。
+
+        该阶段会在下一局 `reset` 时传给新的 `Preprocessor`，从而让 reward shaping
+        和终局奖励真正随训练进度切换，而不是只停留在日志层。
+        """
+        if not stage_name:
+            return
+        self.current_training_stage_name = str(stage_name)
+        if stage_id is not None:
+            self.current_training_stage_id = int(stage_id)
+
+    def get_training_stage(self):
+        """返回当前 actor 正在使用的训练阶段信息。"""
+        return {
+            "stage_name": self.current_training_stage_name,
+            "stage_id": int(self.current_training_stage_id),
+        }
 
     def _empty_action_debug(self):
         """构造默认动作调试信息，便于训练日志记录当前决策来源。"""

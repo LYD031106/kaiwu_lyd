@@ -11,6 +11,7 @@ Training workflow for Robot Vacuum.
 
 import os
 import time
+from collections import deque
 
 import numpy as np
 
@@ -19,6 +20,88 @@ from agent_ppo.feature.definition import SampleData, sample_process
 from common_python.utils.workflow_disaster_recovery import handle_disaster_recovery
 from tools.metrics_utils import get_training_metrics
 from tools.train_env_conf_validate import read_usr_conf
+
+
+EPISODE_METRICS_WINDOW_SIZE = 100
+MIN_STAGE_WINDOW_EPISODES = 20
+
+TRAINING_STAGE_EARLY = "early"
+TRAINING_STAGE_MIDDLE = "middle"
+TRAINING_STAGE_LATE = "late"
+
+TRAINING_STAGE_LABELS = {
+    TRAINING_STAGE_EARLY: "早期",
+    TRAINING_STAGE_MIDDLE: "中期",
+    TRAINING_STAGE_LATE: "后期",
+}
+
+TRAINING_STAGE_IDS = {
+    TRAINING_STAGE_EARLY: 0,
+    TRAINING_STAGE_MIDDLE: 1,
+    TRAINING_STAGE_LATE: 2,
+}
+
+TRAINING_STAGE_THRESHOLDS = {
+    "early": {
+        "first_charge_success_rate_max": 0.35,
+        "battery_depleted_rate_min": 0.30,
+        "charge_route_found_rate_weighted_max": 0.45,
+    },
+    "late": {
+        "first_charge_success_rate_min": 0.75,
+        "battery_depleted_rate_max": 0.08,
+        "charge_route_found_rate_weighted_min": 0.70,
+        "dock_contact_without_charge_mean_max": 2.0,
+        "route_stall_steps_total_mean_max": 8.0,
+    },
+}
+
+FINAL_REWARD_STAGE_PROFILES = {
+    TRAINING_STAGE_EARLY: {
+        "completed_base": 3.2,
+        "completed_clean_scale": 4.8,
+        "completed_charge_scale": 0.8,
+        "completed_first_charge_bonus": 1.0,
+        "battery_depleted_base": -5.0,
+        "battery_depleted_no_charge_extra": -1.2,
+        "near_charger_extra": -0.5,
+        "npc_collision_penalty": -2.7,
+        "other_failure_penalty": -2.4,
+    },
+    TRAINING_STAGE_MIDDLE: {
+        "completed_base": 4.0,
+        "completed_clean_scale": 6.0,
+        "completed_charge_scale": 0.4,
+        "completed_first_charge_bonus": 0.4,
+        "battery_depleted_base": -4.0,
+        "battery_depleted_no_charge_extra": -1.0,
+        "near_charger_extra": -0.4,
+        "npc_collision_penalty": -2.5,
+        "other_failure_penalty": -2.0,
+    },
+    TRAINING_STAGE_LATE: {
+        "completed_base": 4.8,
+        "completed_clean_scale": 7.2,
+        "completed_charge_scale": 0.2,
+        "completed_first_charge_bonus": 0.1,
+        "battery_depleted_base": -4.2,
+        "battery_depleted_no_charge_extra": -0.8,
+        "near_charger_extra": -0.3,
+        "npc_collision_penalty": -2.2,
+        "other_failure_penalty": -1.8,
+    },
+}
+
+
+def _normalize_training_stage_name(stage_name):
+    normalized_name = str(stage_name or TRAINING_STAGE_EARLY).strip().lower()
+    if normalized_name not in TRAINING_STAGE_IDS:
+        return TRAINING_STAGE_EARLY
+    return normalized_name
+
+
+def _get_final_reward_profile(stage_name):
+    return FINAL_REWARD_STAGE_PROFILES[_normalize_training_stage_name(stage_name)]
 
 
 def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
@@ -136,6 +219,8 @@ def _extract_result_details(env_obs, fm, truncated, step):
         "clean_ratio": clean_ratio,
         "first_charge_success": float(charge_count > 0),
         "battery_depleted": float(fail_reason == "battery_depleted"),
+        "training_stage_name": _normalize_training_stage_name(snapshot.get("training_stage_name")),
+        "training_stage_id": int(snapshot.get("training_stage_id", 0)),
         "snapshot": snapshot,
     }
 
@@ -152,26 +237,34 @@ def _compute_final_reward(result_details):
     也就是说，这里只负责在 episode 结束时做一次“方向性校正”：
     完成任务给正奖励，明显失败给负奖励；真正细粒度的回充学习信号仍来自 step reward。
     """
+    reward_profile = _get_final_reward_profile(result_details.get("training_stage_name"))
+
     if result_details["is_completed"]:
         # 正常跑满并完成清扫时，清扫比例是主项，充电次数只给很轻的附加项，
         # 避免策略为了刷充电次数而牺牲主任务。
-        final_reward = 4.0 + 6.0 * result_details["clean_ratio"] + 0.4 * min(result_details["charge_count"], 3)
+        final_reward = (
+            reward_profile["completed_base"]
+            + reward_profile["completed_clean_scale"] * result_details["clean_ratio"]
+            + reward_profile["completed_charge_scale"] * min(result_details["charge_count"], 3)
+        )
+        if result_details["first_charge_success"] > 0:
+            final_reward += reward_profile["completed_first_charge_bonus"]
         return final_reward, "WIN"
 
     if result_details["fail_reason"] == "battery_depleted":
         # 电量耗尽是当前阶段最希望优先压下去的失败类型，所以这里惩罚最重。
-        final_reward = -4.0
+        final_reward = reward_profile["battery_depleted_base"]
         if result_details["charge_count"] <= 0:
-            final_reward -= 1.0
+            final_reward += reward_profile["battery_depleted_no_charge_extra"]
         nearest_charger = result_details["snapshot"]["nearest_charger_dist"]
         if nearest_charger is not None and nearest_charger <= 3:
-            final_reward -= 0.4
+            final_reward += reward_profile["near_charger_extra"]
         return final_reward, "FAIL"
 
     if result_details["fail_reason"] == "npc_collision":
-        return -2.5, "FAIL"
+        return reward_profile["npc_collision_penalty"], "FAIL"
 
-    return -2.0, "FAIL"
+    return reward_profile["other_failure_penalty"], "FAIL"
 
 
 def _build_episode_metrics(result_details):
@@ -223,6 +316,117 @@ def _build_episode_metrics(result_details):
     }
 
 
+def _classify_training_stage(window_metrics):
+    """
+    根据最近窗口指标，将训练状态分为早期 / 中期 / 后期。
+
+    判定原则遵循当前项目的训练目标优先级：
+    1. 先建立“活下来 + 回得去 + 充得上”的生存链路。
+    2. 再追求稳定性。
+    3. 最后优化清扫效率与完成质量。
+    """
+    episode_count = int(window_metrics.get("window_episode_count", 0))
+    first_charge_success_rate = float(window_metrics.get("first_charge_success_rate", 0.0))
+    battery_depleted_rate = float(window_metrics.get("battery_depleted_rate", 0.0))
+    charge_route_found_rate_weighted = float(window_metrics.get("charge_route_found_rate_weighted", 0.0))
+    dock_contact_without_charge_mean = float(window_metrics.get("dock_contact_without_charge_mean", 0.0))
+    route_stall_steps_total_mean = float(window_metrics.get("route_stall_steps_total_mean", 0.0))
+    completed_rate = float(window_metrics.get("completed_rate", 0.0))
+    clean_ratio_mean = float(window_metrics.get("clean_ratio_mean", 0.0))
+
+    early_thresholds = TRAINING_STAGE_THRESHOLDS["early"]
+    late_thresholds = TRAINING_STAGE_THRESHOLDS["late"]
+    reasons = []
+
+    if episode_count < MIN_STAGE_WINDOW_EPISODES:
+        stage_name = TRAINING_STAGE_EARLY
+        reasons.append(
+            f"窗口局数不足({episode_count}<{MIN_STAGE_WINDOW_EPISODES})，默认按早期观察"
+        )
+    else:
+        early_hits = []
+        if first_charge_success_rate < early_thresholds["first_charge_success_rate_max"]:
+            early_hits.append(
+                "首充成功率偏低"
+                f"({first_charge_success_rate:.4f}<{early_thresholds['first_charge_success_rate_max']:.2f})"
+            )
+        if battery_depleted_rate > early_thresholds["battery_depleted_rate_min"]:
+            early_hits.append(
+                "没电率偏高"
+                f"({battery_depleted_rate:.4f}>{early_thresholds['battery_depleted_rate_min']:.2f})"
+            )
+        if charge_route_found_rate_weighted < early_thresholds["charge_route_found_rate_weighted_max"]:
+            early_hits.append(
+                "回桩路径命中率偏低"
+                f"({charge_route_found_rate_weighted:.4f}<{early_thresholds['charge_route_found_rate_weighted_max']:.2f})"
+            )
+
+        if early_hits:
+            stage_name = TRAINING_STAGE_EARLY
+            reasons.extend(early_hits)
+        else:
+            late_checks = [
+                (
+                    first_charge_success_rate >= late_thresholds["first_charge_success_rate_min"],
+                    "首充成功率达标",
+                    f"{first_charge_success_rate:.4f}>={late_thresholds['first_charge_success_rate_min']:.2f}",
+                ),
+                (
+                    battery_depleted_rate <= late_thresholds["battery_depleted_rate_max"],
+                    "没电率已压低",
+                    f"{battery_depleted_rate:.4f}<={late_thresholds['battery_depleted_rate_max']:.2f}",
+                ),
+                (
+                    charge_route_found_rate_weighted >= late_thresholds["charge_route_found_rate_weighted_min"],
+                    "回桩路径命中率达标",
+                    f"{charge_route_found_rate_weighted:.4f}>={late_thresholds['charge_route_found_rate_weighted_min']:.2f}",
+                ),
+                (
+                    dock_contact_without_charge_mean <= late_thresholds["dock_contact_without_charge_mean_max"],
+                    "贴桩未充次数较低",
+                    f"{dock_contact_without_charge_mean:.4f}<={late_thresholds['dock_contact_without_charge_mean_max']:.2f}",
+                ),
+                (
+                    route_stall_steps_total_mean <= late_thresholds["route_stall_steps_total_mean_max"],
+                    "回桩卡顿步数较低",
+                    f"{route_stall_steps_total_mean:.4f}<={late_thresholds['route_stall_steps_total_mean_max']:.2f}",
+                ),
+            ]
+            late_hits = [f"{desc}({detail})" for ok, desc, detail in late_checks if ok]
+            late_ready = len(late_hits) == len(late_checks)
+
+            if late_ready:
+                stage_name = TRAINING_STAGE_LATE
+                reasons.extend(late_hits)
+                reasons.append(
+                    f"当前重点转向效率优化(completed_rate={completed_rate:.4f}, clean_ratio_mean={clean_ratio_mean:.4f})"
+                )
+            else:
+                stage_name = TRAINING_STAGE_MIDDLE
+                reasons.append(
+                    "基础生存链路已脱离早期，但稳定性/效率指标尚未全部达到后期阈值"
+                )
+                reasons.append(
+                    f"首充成功率={first_charge_success_rate:.4f}, 没电率={battery_depleted_rate:.4f}, "
+                    f"完成率={completed_rate:.4f}, 清扫比例={clean_ratio_mean:.4f}"
+                )
+
+    stage_id = TRAINING_STAGE_IDS[stage_name]
+    monitor_metrics = {
+        "training_stage_id": float(stage_id),
+        "training_stage_early": 1.0 if stage_name == TRAINING_STAGE_EARLY else 0.0,
+        "training_stage_middle": 1.0 if stage_name == TRAINING_STAGE_MIDDLE else 0.0,
+        "training_stage_late": 1.0 if stage_name == TRAINING_STAGE_LATE else 0.0,
+    }
+    return {
+        "stage_name": stage_name,
+        "stage_label": TRAINING_STAGE_LABELS[stage_name],
+        "stage_id": stage_id,
+        "monitor_metrics": monitor_metrics,
+        "reasons": reasons,
+    }
+
+
 class EpisodeRunner:
     """按 episode 驱动环境交互、样本收集、终局奖励和监控上报。"""
 
@@ -241,6 +445,190 @@ class EpisodeRunner:
         self.episode_cnt = 0
         self.last_report_monitor_time = 0
         self.last_get_training_metrics_time = 0
+        self.recent_episode_records = deque(maxlen=EPISODE_METRICS_WINDOW_SIZE)
+
+    @staticmethod
+    def _mean(values):
+        return float(sum(values) / len(values)) if values else 0.0
+
+    def _mean_valid(self, key, invalid_values):
+        values = [float(record[key]) for record in self.recent_episode_records if record[key] not in invalid_values]
+        return self._mean(values)
+
+    def _build_episode_record(self, episode_return, result_details, metrics):
+        return {
+            "episode_return": float(episode_return),
+            "completed": float(metrics["completed"]),
+            "battery_depleted": float(metrics["battery_depleted"]),
+            "first_charge_success": float(metrics["first_charge_success"]),
+            "clean_ratio": float(metrics["clean_ratio"]),
+            "first_charge_step": int(metrics["first_charge_step"]),
+            "return_trigger_margin": int(metrics["return_trigger_margin"]),
+            "dock_contact_without_charge": int(metrics["dock_contact_without_charge"]),
+            "route_stall_steps_total": int(metrics["route_stall_steps_total"]),
+            "charge_guidance_steps": int(metrics["charge_guidance_steps"]),
+            "charge_route_found_steps": int(metrics["charge_route_found_steps"]),
+            "fail_reason": str(result_details["fail_reason"]),
+        }
+
+    def _build_window_metrics(self):
+        records = list(self.recent_episode_records)
+        if not records:
+            return {
+                "window_episode_count": 0,
+                "episode_return_mean": 0.0,
+                "episode_return_max": 0.0,
+                "episode_return_min": 0.0,
+                "completed_rate": 0.0,
+                "battery_depleted_rate": 0.0,
+                "first_charge_success_rate": 0.0,
+                "clean_ratio_mean": 0.0,
+                "first_charge_step_mean": 0.0,
+                "return_trigger_margin_mean": 0.0,
+                "dock_contact_without_charge_mean": 0.0,
+                "route_stall_steps_total_mean": 0.0,
+                "charge_route_found_rate_weighted": 0.0,
+                "npc_collision_rate": 0.0,
+                "abnormal_truncated_rate": 0.0,
+                "unknown_failure_rate": 0.0,
+                "other_failure_rate": 0.0,
+            }
+
+        episode_returns = [record["episode_return"] for record in records]
+        episode_count = len(records)
+        charge_guidance_steps_sum = sum(record["charge_guidance_steps"] for record in records)
+        charge_route_found_steps_sum = sum(record["charge_route_found_steps"] for record in records)
+
+        known_failure_reasons = {
+            "completed_max_step",
+            "battery_depleted",
+            "npc_collision",
+            "abnormal_truncated",
+            "unknown_failure",
+        }
+        other_failure_count = sum(
+            1
+            for record in records
+            if not record["completed"] and record["fail_reason"] not in known_failure_reasons
+        )
+
+        return {
+            "window_episode_count": episode_count,
+            "episode_return_mean": round(self._mean(episode_returns), 4),
+            "episode_return_max": round(max(episode_returns), 4),
+            "episode_return_min": round(min(episode_returns), 4),
+            "completed_rate": round(self._mean([record["completed"] for record in records]), 4),
+            "battery_depleted_rate": round(self._mean([record["battery_depleted"] for record in records]), 4),
+            "first_charge_success_rate": round(self._mean([record["first_charge_success"] for record in records]), 4),
+            "clean_ratio_mean": round(self._mean([record["clean_ratio"] for record in records]), 4),
+            "first_charge_step_mean": round(self._mean_valid("first_charge_step", {-1}), 4),
+            "return_trigger_margin_mean": round(self._mean_valid("return_trigger_margin", {-999}), 4),
+            "dock_contact_without_charge_mean": round(
+                self._mean([record["dock_contact_without_charge"] for record in records]), 4
+            ),
+            "route_stall_steps_total_mean": round(
+                self._mean([record["route_stall_steps_total"] for record in records]), 4
+            ),
+            "charge_route_found_rate_weighted": round(
+                float(charge_route_found_steps_sum) / float(charge_guidance_steps_sum)
+                if charge_guidance_steps_sum > 0
+                else 0.0,
+                4,
+            ),
+            "npc_collision_rate": round(
+                sum(1 for record in records if record["fail_reason"] == "npc_collision") / float(episode_count),
+                4,
+            ),
+            "abnormal_truncated_rate": round(
+                sum(1 for record in records if record["fail_reason"] == "abnormal_truncated") / float(episode_count),
+                4,
+            ),
+            "unknown_failure_rate": round(
+                sum(1 for record in records if record["fail_reason"] == "unknown_failure") / float(episode_count),
+                4,
+            ),
+            "other_failure_rate": round(float(other_failure_count) / float(episode_count), 4),
+        }
+
+    @staticmethod
+    def _format_optional_metric(value, digits=3):
+        if value is None:
+            return "None"
+        if isinstance(value, float):
+            return f"{value:.{digits}f}"
+        return str(value)
+
+    def _log_episode_result(self, step, result_str, total_reward, final_reward, episode_return, result_details, metrics):
+        self.logger.info(
+            "[EPISODE_RESULT] "
+            f"ep:{self.episode_cnt} steps:{step} result:{result_str} reason:{result_details['fail_reason']} "
+            f"training_stage:{result_details['training_stage_name']} "
+            f"episode_return:{episode_return:.3f} step_reward_sum:{total_reward:.3f} final_reward:{final_reward:.3f} "
+            f"completed:{int(metrics['completed'])} clean_ratio:{metrics['clean_ratio']:.4f} "
+            f"first_charge_success:{int(metrics['first_charge_success'])} battery_depleted:{int(metrics['battery_depleted'])} "
+            f"charge_count:{metrics['charge_count']} remaining_charge:{metrics['remaining_charge']} "
+            f"explored_ratio:{metrics['explored_ratio']:.4f} total_score:{result_details['total_score']} "
+            f"clean_score:{result_details['clean_score']}"
+        )
+
+    def _log_episode_diagnostics(self, snapshot, action_debug, result_details):
+        self.logger.info(
+            "[EPISODE_DIAG] "
+            f"ep:{self.episode_cnt} pos:{snapshot['pos']} visit:{snapshot['current_visit']} "
+            f"training_stage:{snapshot.get('training_stage_name')} "
+            f"nearest_charger:{snapshot['nearest_charger_dist']} nearest_npc:{snapshot['nearest_npc_dist']} "
+            f"return_mode:{int(snapshot['return_mode'])} return_reason:{snapshot['return_reason']} "
+            f"return_trigger_step:{snapshot['return_trigger_step']} "
+            f"return_trigger_margin:{snapshot['return_trigger_margin']} "
+            f"first_return_trigger_step:{snapshot['first_return_trigger_step']} "
+            f"first_charge_step:{snapshot['first_charge_step']} first_charge_stage:{snapshot['first_charge_stage']} "
+            f"battery_margin:{snapshot['battery_margin']} min_battery_margin:{snapshot['min_battery_margin']} "
+            f"battery_margin_at_first_charge:{snapshot['battery_margin_at_first_charge']} "
+            f"low_battery_steps:{snapshot['low_battery_steps']} "
+            f"low_battery_route_progress_mean:{self._format_optional_metric(snapshot.get('low_battery_route_progress_mean'))} "
+            f"charge_route_found:{int(snapshot['charge_route_found'])} "
+            f"charge_route_found_rate:{snapshot['charge_route_found_rate']:.3f} "
+            f"charge_guidance_steps:{snapshot['charge_guidance_steps']} "
+            f"charge_route_found_steps:{snapshot['charge_route_found_steps']} "
+            f"charge_progress_delta:{self._format_optional_metric(snapshot.get('charge_route_progress_delta'), digits=2)} "
+            f"route_stall_steps_total:{snapshot['route_stall_steps_total']} "
+            f"max_charge_stall_steps:{snapshot['max_charge_stall_steps']} "
+            f"dock_contact_without_charge:{snapshot['dock_contact_without_charge']} "
+            f"action_source:{action_debug['source']} action_sampled:{action_debug['sampled_action']} "
+            f"action_selected:{action_debug['selected_action']} result_code:{result_details['result_code']} "
+            f"result_message:{result_details['result_message']}"
+        )
+
+    def _log_window_metrics(self, window_metrics, active_stage_info, stage_info):
+        self.logger.info(
+            "[EVAL_WINDOW] "
+            f"episodes:{window_metrics['window_episode_count']} "
+            f"episode_return_mean:{window_metrics['episode_return_mean']:.4f} "
+            f"completed_rate:{window_metrics['completed_rate']:.4f} "
+            f"battery_depleted_rate:{window_metrics['battery_depleted_rate']:.4f} "
+            f"first_charge_success_rate:{window_metrics['first_charge_success_rate']:.4f} "
+            f"clean_ratio_mean:{window_metrics['clean_ratio_mean']:.4f} "
+            f"first_charge_step_mean:{window_metrics['first_charge_step_mean']:.4f} "
+            f"return_trigger_margin_mean:{window_metrics['return_trigger_margin_mean']:.4f} "
+            f"charge_route_found_rate_weighted:{window_metrics['charge_route_found_rate_weighted']:.4f} "
+            f"dock_contact_without_charge_mean:{window_metrics['dock_contact_without_charge_mean']:.4f} "
+            f"route_stall_steps_total_mean:{window_metrics['route_stall_steps_total_mean']:.4f}"
+        )
+        self.logger.info(
+            "[TRAIN_STAGE] "
+            f"episodes:{window_metrics['window_episode_count']} "
+            f"active_stage:{active_stage_info['stage_name']}({active_stage_info['stage_label']}) "
+            f"next_stage:{stage_info['stage_name']}({stage_info['stage_label']}) "
+            f"next_stage_id:{stage_info['stage_id']} "
+            f"reasons:{' | '.join(stage_info['reasons'])}"
+        )
+        self.logger.info(
+            "[EVAL_FAILURE] "
+            f"episodes:{window_metrics['window_episode_count']} npc_collision_rate:{window_metrics['npc_collision_rate']:.4f} "
+            f"abnormal_truncated_rate:{window_metrics['abnormal_truncated_rate']:.4f} "
+            f"unknown_failure_rate:{window_metrics['unknown_failure_rate']:.4f} "
+            f"other_failure_rate:{window_metrics['other_failure_rate']:.4f}"
+        )
 
     def run_episodes(self):
         """
@@ -271,6 +659,10 @@ class EpisodeRunner:
             # 每局开始都重新加载一次最新模型，确保 actor 侧尽快跟上 learner 已更新的参数。
             self.agent.reset(env_obs)
             self.agent.load_model(id="latest")
+            active_stage_info = self.agent.get_training_stage()
+            active_stage_info["stage_label"] = TRAINING_STAGE_LABELS.get(
+                active_stage_info["stage_name"], active_stage_info["stage_name"]
+            )
 
             obs_data, _ = self.agent.observation_process(env_obs)
 
@@ -282,7 +674,8 @@ class EpisodeRunner:
 
             self.logger.info(
                 f"Episode {self.episode_cnt} start, feature_dim={Config.DIM_OF_OBSERVATION}, "
-                f"local_view={Config.LOCAL_VIEW_SIZE}, global_state={Config.GLOBAL_FEATURE_SIZE}"
+                f"local_view={Config.LOCAL_VIEW_SIZE}, global_state={Config.GLOBAL_FEATURE_SIZE}, "
+                f"training_stage={active_stage_info['stage_name']}"
             )
 
             while not done:
@@ -321,59 +714,26 @@ class EpisodeRunner:
                     result_details = _extract_result_details(env_obs, fm, truncated, step)
                     final_reward, result_str = _compute_final_reward(result_details)
                     metrics = _build_episode_metrics(result_details)
+                    episode_return = total_reward + final_reward
+                    self.recent_episode_records.append(
+                        self._build_episode_record(episode_return, result_details, metrics)
+                    )
+                    window_metrics = self._build_window_metrics()
+                    stage_info = _classify_training_stage(window_metrics)
+                    self.agent.set_training_stage(stage_info["stage_name"], stage_info["stage_id"])
                     snapshot = result_details["snapshot"]
                     action_debug = self.agent.get_action_debug_snapshot()
 
-                    charge_progress_delta = snapshot.get("charge_route_progress_delta")
-                    charge_progress_delta_str = (
-                        "None" if charge_progress_delta is None else f"{float(charge_progress_delta):.2f}"
+                    self._log_episode_result(
+                        step=step,
+                        result_str=result_str,
+                        total_reward=total_reward,
+                        final_reward=final_reward,
+                        episode_return=episode_return,
+                        result_details=result_details,
+                        metrics=metrics,
                     )
-                    low_battery_route_progress_mean = snapshot.get("low_battery_route_progress_mean")
-                    low_battery_route_progress_mean_str = (
-                        "None"
-                        if low_battery_route_progress_mean is None
-                        else f"{float(low_battery_route_progress_mean):.3f}"
-                    )
-
-                    self.logger.info(
-                        f"[GAMEOVER] ep:{self.episode_cnt} steps:{step} result:{result_str} "
-                        f"reason:{result_details['fail_reason']} final_bonus:{final_reward:.2f} "
-                        f"total_reward:{total_reward:.3f} total_score:{result_details['total_score']} "
-                        f"clean_score:{result_details['clean_score']} clean_ratio:{metrics['clean_ratio']:.4f} "
-                        f"charge_count:{metrics['charge_count']} "
-                        f"first_charge_success:{int(metrics['first_charge_success'])} "
-                        f"battery_depleted:{int(metrics['battery_depleted'])} "
-                        f"remaining_charge:{metrics['remaining_charge']} "
-                        f"explored_ratio:{metrics['explored_ratio']:.4f} "
-                        f"pos:{snapshot['pos']} visit:{snapshot['current_visit']} "
-                        f"nearest_charger:{snapshot['nearest_charger_dist']} "
-                        f"nearest_npc:{snapshot['nearest_npc_dist']} "
-                        f"return_mode:{snapshot['return_mode']} "
-                        f"return_reason:{snapshot['return_reason']} "
-                        f"return_trigger_step:{snapshot['return_trigger_step']} "
-                        f"return_trigger_margin:{snapshot['return_trigger_margin']} "
-                        f"first_return_trigger_step:{snapshot['first_return_trigger_step']} "
-                        f"first_charge_step:{snapshot['first_charge_step']} "
-                        f"first_charge_stage:{snapshot['first_charge_stage']} "
-                        f"battery_margin:{snapshot['battery_margin']} "
-                        f"min_battery_margin:{snapshot['min_battery_margin']} "
-                        f"battery_margin_at_first_charge:{snapshot['battery_margin_at_first_charge']} "
-                        f"low_battery_steps:{snapshot['low_battery_steps']} "
-                        f"low_battery_route_progress_mean:{low_battery_route_progress_mean_str} "
-                        f"route_found:{snapshot['charge_route_found']} "
-                        f"route_found_rate:{snapshot['charge_route_found_rate']:.3f} "
-                        f"charge_guidance_steps:{snapshot['charge_guidance_steps']} "
-                        f"charge_route_found_steps:{snapshot['charge_route_found_steps']} "
-                        f"charge_progress_delta:{charge_progress_delta_str} "
-                        f"route_stall_steps_total:{snapshot['route_stall_steps_total']} "
-                        f"max_charge_stall_steps:{snapshot['max_charge_stall_steps']} "
-                        f"dock_contact_without_charge:{snapshot['dock_contact_without_charge']} "
-                        f"action_source:{action_debug['source']} "
-                        f"action_sampled:{action_debug['sampled_action']} "
-                        f"action_selected:{action_debug['selected_action']} "
-                        f"result_code:{result_details['result_code']} "
-                        f"result_message:{result_details['result_message']}"
-                    )
+                    self._log_episode_diagnostics(snapshot, action_debug, result_details)
 
                 # 单步样本先按 step reward 落盘；若终局，再把 final reward 叠到最后一帧。
                 reward_arr = np.array([reward_scalar], dtype=np.float32)
@@ -399,36 +759,48 @@ class EpisodeRunner:
                     now = time.time()
                     if now - self.last_report_monitor_time >= 60 and self.monitor:
                         # 监控侧只上报高价值的整局指标，避免面板里被大量中间字段淹没。
-                        self.monitor.put_data(
+                        monitor_payload = {
+                            "episode_return": episode_return,
+                            "episode_cnt": self.episode_cnt,
+                            "clean_ratio": metrics["clean_ratio"],
+                            "charge_count": metrics["charge_count"],
+                            "first_charge_success": metrics["first_charge_success"],
+                            "battery_depleted": metrics["battery_depleted"],
+                            "remaining_charge": metrics["remaining_charge"],
+                            "completed": metrics["completed"],
+                            "explored_ratio": metrics["explored_ratio"],
+                            "nearest_charger_dist": metrics["nearest_charger_dist"],
+                            "first_charge_step": metrics["first_charge_step"],
+                            "return_trigger_step": metrics["return_trigger_step"],
+                            "return_trigger_margin": metrics["return_trigger_margin"],
+                            "first_return_trigger_step": metrics["first_return_trigger_step"],
+                            "min_battery_margin": metrics["min_battery_margin"],
+                            "battery_margin_at_first_charge": metrics["battery_margin_at_first_charge"],
+                            "low_battery_steps": metrics["low_battery_steps"],
+                            "low_battery_route_progress_mean": metrics["low_battery_route_progress_mean"],
+                            "charge_route_found_rate": metrics["charge_route_found_rate"],
+                            "route_stall_steps_total": metrics["route_stall_steps_total"],
+                            "max_charge_stall_steps": metrics["max_charge_stall_steps"],
+                            "dock_contact_without_charge": metrics["dock_contact_without_charge"],
+                            "charge_guidance_steps": metrics["charge_guidance_steps"],
+                            "charge_route_found_steps": metrics["charge_route_found_steps"],
+                        }
+                        monitor_payload.update(window_metrics)
+                        monitor_payload.update(stage_info["monitor_metrics"])
+                        monitor_payload.update(
                             {
-                                os.getpid(): {
-                                    "reward": total_reward + final_reward,
-                                    "episode_cnt": self.episode_cnt,
-                                    "clean_ratio": metrics["clean_ratio"],
-                                    "charge_count": metrics["charge_count"],
-                                    "first_charge_success": metrics["first_charge_success"],
-                                    "battery_depleted": metrics["battery_depleted"],
-                                    "remaining_charge": metrics["remaining_charge"],
-                                    "completed": metrics["completed"],
-                                    "explored_ratio": metrics["explored_ratio"],
-                                    "nearest_charger_dist": metrics["nearest_charger_dist"],
-                                    "first_charge_step": metrics["first_charge_step"],
-                                    "return_trigger_step": metrics["return_trigger_step"],
-                                    "return_trigger_margin": metrics["return_trigger_margin"],
-                                    "first_return_trigger_step": metrics["first_return_trigger_step"],
-                                    "min_battery_margin": metrics["min_battery_margin"],
-                                    "battery_margin_at_first_charge": metrics["battery_margin_at_first_charge"],
-                                    "low_battery_steps": metrics["low_battery_steps"],
-                                    "low_battery_route_progress_mean": metrics["low_battery_route_progress_mean"],
-                                    "charge_route_found_rate": metrics["charge_route_found_rate"],
-                                    "route_stall_steps_total": metrics["route_stall_steps_total"],
-                                    "max_charge_stall_steps": metrics["max_charge_stall_steps"],
-                                    "dock_contact_without_charge": metrics["dock_contact_without_charge"],
-                                    "charge_guidance_steps": metrics["charge_guidance_steps"],
-                                    "charge_route_found_steps": metrics["charge_route_found_steps"],
-                                }
+                                "active_training_stage_id": float(active_stage_info["stage_id"]),
+                                "active_training_stage_early": 1.0 if active_stage_info["stage_name"] == TRAINING_STAGE_EARLY else 0.0,
+                                "active_training_stage_middle": 1.0 if active_stage_info["stage_name"] == TRAINING_STAGE_MIDDLE else 0.0,
+                                "active_training_stage_late": 1.0 if active_stage_info["stage_name"] == TRAINING_STAGE_LATE else 0.0,
                             }
                         )
+                        self.monitor.put_data(
+                            {
+                                os.getpid(): monitor_payload
+                            }
+                        )
+                        self._log_window_metrics(window_metrics, active_stage_info, stage_info)
                         self.last_report_monitor_time = now
 
                     if collector:

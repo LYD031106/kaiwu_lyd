@@ -30,3 +30,9 @@ code/agent_ppo/backup/
 SKILLS.md
 baseline_structure_analysis.md
 competition_summary.md
+
+# docker 
+.gitignore
+.DS_Store
+.doc/
+train/.docker-compose.yaml
