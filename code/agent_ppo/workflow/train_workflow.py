@@ -43,9 +43,12 @@ TRAINING_STAGE_IDS = {
 
 TRAINING_STAGE_THRESHOLDS = {
     "early": {
-        "first_charge_success_rate_max": 0.35,
-        "battery_depleted_rate_min": 0.30,
-        "charge_route_found_rate_weighted_max": 0.45,
+        "first_charge_success_rate_max": 0.55,
+        "battery_depleted_rate_min": 0.45,
+        "charge_route_found_rate_weighted_max": 0.55,
+        "dock_success_given_contact_rate_max": 0.60,
+        "dock_contact_without_charge_mean_min": 2.5,
+        "dock_stall_steps_mean_min": 3.0,
     },
     "late": {
         "first_charge_success_rate_min": 0.75,
@@ -53,6 +56,9 @@ TRAINING_STAGE_THRESHOLDS = {
         "charge_route_found_rate_weighted_min": 0.70,
         "dock_contact_without_charge_mean_max": 2.0,
         "route_stall_steps_total_mean_max": 8.0,
+        "dock_success_given_contact_rate_min": 0.82,
+        "dock_stall_steps_mean_max": 1.5,
+        "dock_regress_count_mean_max": 1.0,
     },
 }
 
@@ -311,6 +317,12 @@ def _build_episode_metrics(result_details):
         "route_stall_steps_total": int(snapshot["route_stall_steps_total"]),
         "max_charge_stall_steps": int(snapshot["max_charge_stall_steps"]),
         "dock_contact_without_charge": int(snapshot["dock_contact_without_charge"]),
+        "near_dock_entries": int(snapshot.get("near_dock_entries", 0)),
+        "dock_contact_entries": int(snapshot.get("dock_contact_entries", 0)),
+        "dock_success_after_contact_count": int(snapshot.get("dock_success_after_contact_count", 0)),
+        "charge_success_after_dock_step_sum": int(snapshot.get("charge_success_after_dock_step_sum", 0)),
+        "dock_stall_steps_total": int(snapshot.get("dock_stall_steps_total", 0)),
+        "dock_regress_count": int(snapshot.get("dock_regress_count", 0)),
         "charge_guidance_steps": int(snapshot["charge_guidance_steps"]),
         "charge_route_found_steps": int(snapshot["charge_route_found_steps"]),
     }
@@ -331,6 +343,10 @@ def _classify_training_stage(window_metrics):
     charge_route_found_rate_weighted = float(window_metrics.get("charge_route_found_rate_weighted", 0.0))
     dock_contact_without_charge_mean = float(window_metrics.get("dock_contact_without_charge_mean", 0.0))
     route_stall_steps_total_mean = float(window_metrics.get("route_stall_steps_total_mean", 0.0))
+    near_dock_entry_rate = float(window_metrics.get("near_dock_entry_rate", 0.0))
+    dock_success_given_contact_rate = float(window_metrics.get("dock_success_given_contact_rate", 0.0))
+    dock_stall_steps_mean = float(window_metrics.get("dock_stall_steps_mean", 0.0))
+    dock_regress_count_mean = float(window_metrics.get("dock_regress_count_mean", 0.0))
     completed_rate = float(window_metrics.get("completed_rate", 0.0))
     clean_ratio_mean = float(window_metrics.get("clean_ratio_mean", 0.0))
 
@@ -359,6 +375,21 @@ def _classify_training_stage(window_metrics):
             early_hits.append(
                 "回桩路径命中率偏低"
                 f"({charge_route_found_rate_weighted:.4f}<{early_thresholds['charge_route_found_rate_weighted_max']:.2f})"
+            )
+        if dock_success_given_contact_rate < early_thresholds["dock_success_given_contact_rate_max"]:
+            early_hits.append(
+                "贴桩后充上成功率偏低"
+                f"({dock_success_given_contact_rate:.4f}<{early_thresholds['dock_success_given_contact_rate_max']:.2f})"
+            )
+        if dock_contact_without_charge_mean > early_thresholds["dock_contact_without_charge_mean_min"]:
+            early_hits.append(
+                "贴桩未充仍明显偏高"
+                f"({dock_contact_without_charge_mean:.4f}>{early_thresholds['dock_contact_without_charge_mean_min']:.2f})"
+            )
+        if dock_stall_steps_mean > early_thresholds["dock_stall_steps_mean_min"]:
+            early_hits.append(
+                "近桩停滞步数偏高"
+                f"({dock_stall_steps_mean:.4f}>{early_thresholds['dock_stall_steps_mean_min']:.2f})"
             )
 
         if early_hits:
@@ -391,6 +422,21 @@ def _classify_training_stage(window_metrics):
                     "回桩卡顿步数较低",
                     f"{route_stall_steps_total_mean:.4f}<={late_thresholds['route_stall_steps_total_mean_max']:.2f}",
                 ),
+                (
+                    dock_success_given_contact_rate >= late_thresholds["dock_success_given_contact_rate_min"],
+                    "贴桩后对接成功率达标",
+                    f"{dock_success_given_contact_rate:.4f}>={late_thresholds['dock_success_given_contact_rate_min']:.2f}",
+                ),
+                (
+                    dock_stall_steps_mean <= late_thresholds["dock_stall_steps_mean_max"],
+                    "近桩停滞步数较低",
+                    f"{dock_stall_steps_mean:.4f}<={late_thresholds['dock_stall_steps_mean_max']:.2f}",
+                ),
+                (
+                    dock_regress_count_mean <= late_thresholds["dock_regress_count_mean_max"],
+                    "近桩回退次数较低",
+                    f"{dock_regress_count_mean:.4f}<={late_thresholds['dock_regress_count_mean_max']:.2f}",
+                ),
             ]
             late_hits = [f"{desc}({detail})" for ok, desc, detail in late_checks if ok]
             late_ready = len(late_hits) == len(late_checks)
@@ -408,6 +454,7 @@ def _classify_training_stage(window_metrics):
                 )
                 reasons.append(
                     f"首充成功率={first_charge_success_rate:.4f}, 没电率={battery_depleted_rate:.4f}, "
+                    f"近桩进入率={near_dock_entry_rate:.4f}, 贴桩成功率={dock_success_given_contact_rate:.4f}, "
                     f"完成率={completed_rate:.4f}, 清扫比例={clean_ratio_mean:.4f}"
                 )
 
@@ -465,6 +512,12 @@ class EpisodeRunner:
             "first_charge_step": int(metrics["first_charge_step"]),
             "return_trigger_margin": int(metrics["return_trigger_margin"]),
             "dock_contact_without_charge": int(metrics["dock_contact_without_charge"]),
+            "near_dock_entries": int(metrics["near_dock_entries"]),
+            "dock_contact_entries": int(metrics["dock_contact_entries"]),
+            "dock_success_after_contact_count": int(metrics["dock_success_after_contact_count"]),
+            "charge_success_after_dock_step_sum": int(metrics["charge_success_after_dock_step_sum"]),
+            "dock_stall_steps_total": int(metrics["dock_stall_steps_total"]),
+            "dock_regress_count": int(metrics["dock_regress_count"]),
             "route_stall_steps_total": int(metrics["route_stall_steps_total"]),
             "charge_guidance_steps": int(metrics["charge_guidance_steps"]),
             "charge_route_found_steps": int(metrics["charge_route_found_steps"]),
@@ -486,6 +539,11 @@ class EpisodeRunner:
                 "first_charge_step_mean": 0.0,
                 "return_trigger_margin_mean": 0.0,
                 "dock_contact_without_charge_mean": 0.0,
+                "near_dock_entry_rate": 0.0,
+                "dock_success_given_contact_rate": 0.0,
+                "dock_stall_steps_mean": 0.0,
+                "dock_regress_count_mean": 0.0,
+                "charge_success_after_dock_step_mean": 0.0,
                 "route_stall_steps_total_mean": 0.0,
                 "charge_route_found_rate_weighted": 0.0,
                 "npc_collision_rate": 0.0,
@@ -498,6 +556,10 @@ class EpisodeRunner:
         episode_count = len(records)
         charge_guidance_steps_sum = sum(record["charge_guidance_steps"] for record in records)
         charge_route_found_steps_sum = sum(record["charge_route_found_steps"] for record in records)
+        near_dock_entries_sum = sum(record["near_dock_entries"] for record in records)
+        dock_contact_entries_sum = sum(record["dock_contact_entries"] for record in records)
+        dock_success_after_contact_sum = sum(record["dock_success_after_contact_count"] for record in records)
+        charge_success_after_dock_step_sum = sum(record["charge_success_after_dock_step_sum"] for record in records)
 
         known_failure_reasons = {
             "completed_max_step",
@@ -525,6 +587,23 @@ class EpisodeRunner:
             "return_trigger_margin_mean": round(self._mean_valid("return_trigger_margin", {-999}), 4),
             "dock_contact_without_charge_mean": round(
                 self._mean([record["dock_contact_without_charge"] for record in records]), 4
+            ),
+            "near_dock_entry_rate": round(
+                sum(1 for record in records if record["near_dock_entries"] > 0) / float(episode_count), 4
+            ),
+            "dock_success_given_contact_rate": round(
+                float(dock_success_after_contact_sum) / float(dock_contact_entries_sum)
+                if dock_contact_entries_sum > 0
+                else 0.0,
+                4,
+            ),
+            "dock_stall_steps_mean": round(self._mean([record["dock_stall_steps_total"] for record in records]), 4),
+            "dock_regress_count_mean": round(self._mean([record["dock_regress_count"] for record in records]), 4),
+            "charge_success_after_dock_step_mean": round(
+                float(charge_success_after_dock_step_sum) / float(dock_success_after_contact_sum)
+                if dock_success_after_contact_sum > 0
+                else 0.0,
+                4,
             ),
             "route_stall_steps_total_mean": round(
                 self._mean([record["route_stall_steps_total"] for record in records]), 4
@@ -590,6 +669,12 @@ class EpisodeRunner:
             f"charge_route_found_rate:{snapshot['charge_route_found_rate']:.3f} "
             f"charge_guidance_steps:{snapshot['charge_guidance_steps']} "
             f"charge_route_found_steps:{snapshot['charge_route_found_steps']} "
+            f"near_dock_entries:{snapshot.get('near_dock_entries', 0)} "
+            f"dock_contact_entries:{snapshot.get('dock_contact_entries', 0)} "
+            f"dock_success_after_contact_count:{snapshot.get('dock_success_after_contact_count', 0)} "
+            f"charge_success_after_dock_step_sum:{snapshot.get('charge_success_after_dock_step_sum', 0)} "
+            f"dock_stall_steps_total:{snapshot.get('dock_stall_steps_total', 0)} "
+            f"dock_regress_count:{snapshot.get('dock_regress_count', 0)} "
             f"charge_progress_delta:{self._format_optional_metric(snapshot.get('charge_route_progress_delta'), digits=2)} "
             f"route_stall_steps_total:{snapshot['route_stall_steps_total']} "
             f"max_charge_stall_steps:{snapshot['max_charge_stall_steps']} "
@@ -611,6 +696,11 @@ class EpisodeRunner:
             f"first_charge_step_mean:{window_metrics['first_charge_step_mean']:.4f} "
             f"return_trigger_margin_mean:{window_metrics['return_trigger_margin_mean']:.4f} "
             f"charge_route_found_rate_weighted:{window_metrics['charge_route_found_rate_weighted']:.4f} "
+            f"near_dock_entry_rate:{window_metrics['near_dock_entry_rate']:.4f} "
+            f"dock_success_given_contact_rate:{window_metrics['dock_success_given_contact_rate']:.4f} "
+            f"dock_stall_steps_mean:{window_metrics['dock_stall_steps_mean']:.4f} "
+            f"dock_regress_count_mean:{window_metrics['dock_regress_count_mean']:.4f} "
+            f"charge_success_after_dock_step_mean:{window_metrics['charge_success_after_dock_step_mean']:.4f} "
             f"dock_contact_without_charge_mean:{window_metrics['dock_contact_without_charge_mean']:.4f} "
             f"route_stall_steps_total_mean:{window_metrics['route_stall_steps_total_mean']:.4f}"
         )

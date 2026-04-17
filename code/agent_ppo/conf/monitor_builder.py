@@ -239,6 +239,56 @@ def build_monitor():
         )
         .end_panel()
         .add_panel(
+            name="进入近桩区比率",
+            name_en="near_dock_entry_rate",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="near_dock_entry_rate",
+            expr="avg(near_dock_entry_rate{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="贴桩后成功充电率",
+            name_en="dock_success_given_contact_rate",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="dock_success_given_contact_rate",
+            expr="avg(dock_success_given_contact_rate{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="近桩停滞步数均值",
+            name_en="dock_stall_steps_mean",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="dock_stall_steps_mean",
+            expr="avg(dock_stall_steps_mean{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="近桩回退次数均值",
+            name_en="dock_regress_count_mean",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="dock_regress_count_mean",
+            expr="avg(dock_regress_count_mean{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="贴桩后成功充电步数均值",
+            name_en="charge_success_after_dock_step_mean",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="charge_success_after_dock_step_mean",
+            expr="avg(charge_success_after_dock_step_mean{})",
+        )
+        .end_panel()
+        .add_panel(
             name="回桩卡顿步数均值",
             name_en="route_stall_steps_total_mean",
             type="line",

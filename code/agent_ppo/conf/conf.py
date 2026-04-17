@@ -42,3 +42,7 @@ class Config:
     LOAD_MODEL_SWITCH = False  # 是否开启读取 checkpoint 的逻辑
     LOAD_MODEL_PATH = ""  # 读取的 checkpoint 文件名路径 (如果为空且开关为True，则走原本的 default path)
 
+    # 训练模型保存控制
+    SAVE_MODEL_SWITCH = True  # 是否开启保存 checkpoint 的逻辑
+    SAVE_MODEL_PATH = ""  # 保存的 checkpoint 文件名路径 (如果为空且开关为True，则走原本的 default path)
+

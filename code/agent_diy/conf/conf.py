@@ -17,7 +17,7 @@ class Config:
 
     # Whether to use CNN networks
     # 是否使用CNN网络
-    USE_CNN = False
+    USE_CNN = True
     VIEW_SIZE = 50 if USE_CNN else 0
 
     FEATURE_VECTOR_SHAPE = (153,)
@@ -38,6 +38,7 @@ class Config:
     # 价值函数损失系数
     VALUE_LOSS_COEFF = 0.5
 
-    # Entropy regularization coefficient
-    # 熵正则化系数
-    ENTROPY_LOSS_COEFF = 0.025
+    # Gradient clipping
+    # 梯度裁剪
+    USE_GRAD_CLIP = True
+    GRAD_CLIP_RANGE = 0.5

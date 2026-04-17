@@ -203,10 +203,21 @@ class Preprocessor:
         self.low_battery_route_progress_sum = 0.0
         self.low_battery_route_progress_count = 0
         self.dock_contact_without_charge = 0
+        self.near_dock_entries = 0
+        self.dock_contact_entries = 0
+        self.dock_success_after_contact_count = 0
+        self.charge_success_after_dock_step_sum = 0
+        self.dock_stall_steps_total = 0
+        self.dock_regress_count = 0
         self.route_stall_steps_total = 0
         self.max_charge_stall_steps = 0
         self.charge_route_found_steps = 0
         self.charge_guidance_steps = 0
+        self._dock_near_zone_active = False
+        self._dock_contact_zone_active = False
+        self._dock_contact_pending = False
+        self._dock_contact_wait_steps = 0
+        self._dock_closest_dist = None
 
         self._view_map = np.zeros((self.VIEW_SIZE, self.VIEW_SIZE), dtype=np.float32)
         self._legal_act = [1] * 8
@@ -704,6 +715,33 @@ class Preprocessor:
                 self.route_stall_steps_total += 1
                 self.max_charge_stall_steps = max(self.max_charge_stall_steps, stall_steps)
 
+        in_near_dock_zone = bool(guidance.get("dock_mode", False) and target_dist is not None and int(target_dist) <= 3)
+        in_dock_contact_zone = bool(guidance.get("dock_mode", False) and target_dist is not None and int(target_dist) <= 1)
+
+        if in_near_dock_zone and not self._dock_near_zone_active:
+            self.near_dock_entries += 1
+        self._dock_near_zone_active = in_near_dock_zone
+
+        if in_dock_contact_zone and not self._dock_contact_zone_active:
+            self.dock_contact_entries += 1
+            self._dock_contact_pending = True
+            self._dock_contact_wait_steps = 0
+
+        if self._dock_contact_pending and not charged_this_step:
+            self._dock_contact_wait_steps += 1
+
+        if should_return and guidance.get("dock_mode", False) and target_dist is not None:
+            current_dist = int(target_dist)
+            if self._dock_closest_dist is None or current_dist < self._dock_closest_dist:
+                self._dock_closest_dist = current_dist
+            elif self._dock_closest_dist <= 2 and current_dist >= self._dock_closest_dist + 1:
+                self.dock_regress_count += 1
+                self._dock_closest_dist = current_dist
+            if current_dist <= 2 and stall_steps > 0:
+                self.dock_stall_steps_total += 1
+        else:
+            self._dock_closest_dist = None
+
         if (
             guidance.get("dock_mode", False)
             and target_dist is not None
@@ -717,6 +755,17 @@ class Preprocessor:
                 self.first_charge_step = int(self.step_no)
             if self.battery_margin_at_first_charge is None:
                 self.battery_margin_at_first_charge = battery_margin
+            if self._dock_contact_pending:
+                self.dock_success_after_contact_count += 1
+                self.charge_success_after_dock_step_sum += int(self._dock_contact_wait_steps)
+                self._dock_contact_pending = False
+                self._dock_contact_wait_steps = 0
+
+        if not in_dock_contact_zone and not charged_this_step and self._dock_contact_pending and self._dock_contact_wait_steps > 12:
+            self._dock_contact_pending = False
+            self._dock_contact_wait_steps = 0
+
+        self._dock_contact_zone_active = in_dock_contact_zone
 
     def _update_memory(self):
         """把当前局部视野写入全局记忆地图，并标记对应区域已探索。"""
@@ -2637,6 +2686,12 @@ class Preprocessor:
             "low_battery_steps": int(self.low_battery_steps),
             "low_battery_route_progress_mean": low_battery_route_progress_mean,
             "dock_contact_without_charge": int(self.dock_contact_without_charge),
+            "near_dock_entries": int(self.near_dock_entries),
+            "dock_contact_entries": int(self.dock_contact_entries),
+            "dock_success_after_contact_count": int(self.dock_success_after_contact_count),
+            "charge_success_after_dock_step_sum": int(self.charge_success_after_dock_step_sum),
+            "dock_stall_steps_total": int(self.dock_stall_steps_total),
+            "dock_regress_count": int(self.dock_regress_count),
             "route_stall_steps_total": int(self.route_stall_steps_total),
             "max_charge_stall_steps": int(self.max_charge_stall_steps),
             "charge_route_found_steps": int(self.charge_route_found_steps),
@@ -2739,9 +2794,13 @@ class Preprocessor:
         # 统一的轻微生存成本，避免策略通过无意义拖时长白拿零奖励。
         reward = -0.0025 * profile["base_step_cost_scale"]
 
-        # 当已经进入回桩/低电量阶段时，弱化清扫和探索奖励，避免局部收益继续把策略拉离充电目标。
-        clean_scale = 0.22 if low_battery else (0.35 if should_return else 1.0)
-        explore_scale = 0.12 if low_battery else (0.25 if should_return else 1.0)
+        # early 期把学习重心收紧到“活下来并充上”，保留极小的清扫/探索正信号避免完全断粮。
+        if first_charge_phase:
+            clean_scale = 0.08 if low_battery else (0.16 if should_return else 0.32)
+            explore_scale = 0.04 if low_battery else (0.10 if should_return else 0.24)
+        else:
+            clean_scale = 0.18 if low_battery else (0.30 if should_return else 1.0)
+            explore_scale = 0.08 if low_battery else (0.22 if should_return else 1.0)
         reward += 0.08 * cleaned_this_step * clean_scale * profile["clean_gain_scale"]
         reward += 0.0035 * min(new_explored_cells, 6) * explore_scale * profile["explore_gain_scale"]
 
@@ -2785,6 +2844,20 @@ class Preprocessor:
         # 进入回桩 / 低电量阶段后，奖励核心变成“是否真的在向充电桩推进”。
         if should_return or low_battery:
             reward -= (0.004 if low_battery else 0.0015) * profile["return_risk_penalty_scale"]
+            if dock_mode and target_dist is not None and not charged_this_step:
+                dock_dist = int(target_dist)
+                dock_layer_bonus = 0.0
+                if dock_dist <= 5:
+                    dock_layer_bonus += 0.010
+                if dock_dist <= 3:
+                    dock_layer_bonus += 0.018
+                if dock_dist <= 2:
+                    dock_layer_bonus += 0.026
+                if dock_dist <= 1:
+                    dock_layer_bonus += 0.032
+                if dock_layer_bonus > 0:
+                    reward += dock_layer_bonus * profile["return_progress_scale"]
+
             if route_progress is not None:
                 progress_scale = (0.040 if dock_mode else 0.036) * profile["return_progress_scale"]
                 regress_scale = (0.060 if dock_mode else 0.055) * profile["return_risk_penalty_scale"]
@@ -2808,6 +2881,12 @@ class Preprocessor:
                     elif route_progress < 0:
                         reward += 0.018 * max(route_progress, -2.0) * profile["return_risk_penalty_scale"]
 
+                if dock_mode and target_dist is not None and int(target_dist) <= 2:
+                    if route_progress >= 0.5:
+                        reward += 0.018 * min(route_progress, 1.5) * profile["return_progress_scale"]
+                    elif route_progress <= -0.25:
+                        reward += 0.030 * max(route_progress, -1.5) * profile["return_risk_penalty_scale"]
+
             if critical_battery:
                 reward -= 0.035 * profile["return_risk_penalty_scale"]
 
@@ -2817,19 +2896,22 @@ class Preprocessor:
                 reward -= 0.0035 * profile["return_risk_penalty_scale"]
 
             if stall_steps >= 2:
-                # [修改] 加重卡顿惩罚 (0.010 -> 0.015)
                 reward -= 0.015 * min(stall_steps, 6) * profile["return_risk_penalty_scale"]
                 if dock_mode:
-                    # [修改] 贴桩阶段卡顿更是翻倍惩罚 (0.005 -> 0.015)
                     reward -= 0.015 * min(stall_steps, 4) * profile["return_risk_penalty_scale"]
 
-            if dock_mode and target_dist is not None and int(target_dist) <= 1 and not charged_this_step:
-                # [修改] 贴桩不充的极刑惩罚 (0.055 -> 0.080)，逼迫它必须对接！
-                reward -= 0.080 * profile["return_risk_penalty_scale"]
-            elif dock_mode and target_dist is not None and int(target_dist) <= 2:
-                if route_progress is not None and route_progress <= 0:
-                    # [修改] 近桩还敢退步/原地的惩罚 (0.015 -> 0.040)
+            if dock_mode and target_dist is not None and not charged_this_step:
+                dock_dist = int(target_dist)
+                if dock_dist <= 2 and route_progress is not None and route_progress <= 0:
+                    reward -= 0.020 * profile["return_risk_penalty_scale"]
+                if dock_dist <= 2 and stall_steps >= 2:
+                    reward -= (0.016 + 0.004 * min(stall_steps - 2, 4)) * profile["return_risk_penalty_scale"]
+                if dock_dist <= 1:
                     reward -= 0.040 * profile["return_risk_penalty_scale"]
+                    if route_progress is not None and route_progress <= 0:
+                        reward -= 0.024 * profile["return_risk_penalty_scale"]
+                    if stall_steps >= 3:
+                        reward -= (0.020 + 0.006 * min(stall_steps - 3, 4)) * profile["return_risk_penalty_scale"]
 
         # 当已经非常接近回桩阈值却还没进入回桩模式时，也给一个轻微警告，
         # 让策略逐步学会“不要把安全余量耗到极限再回”。
