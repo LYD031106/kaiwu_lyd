@@ -35,14 +35,10 @@ class Config:
     CLIP_PARAM = 0.2
     VF_COEF = 0.5
 
+    # Gradient clipping
+    # 梯度裁剪
+    USE_GRAD_CLIP = True
+    GRAD_CLIP_RANGE = 0.5
+
     LABEL_SIZE_LIST = [ACTION_NUM]
     LEGAL_ACTION_SIZE_LIST = LABEL_SIZE_LIST.copy()
-
-    # 训练模型加载控制
-    LOAD_MODEL_SWITCH = False  # 是否开启读取 checkpoint 的逻辑
-    LOAD_MODEL_PATH = ""  # 读取的 checkpoint 文件名路径 (如果为空且开关为True，则走原本的 default path)
-
-    # 训练模型保存控制
-    SAVE_MODEL_SWITCH = True  # 是否开启保存 checkpoint 的逻辑
-    SAVE_MODEL_PATH = ""  # 保存的 checkpoint 文件名路径 (如果为空且开关为True，则走原本的 default path)
-

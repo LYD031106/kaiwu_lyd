@@ -2804,9 +2804,40 @@ class Preprocessor:
         reward += 0.08 * cleaned_this_step * clean_scale * profile["clean_gain_scale"]
         reward += 0.0035 * min(new_explored_cells, 6) * explore_scale * profile["explore_gain_scale"]
 
-        # 对高访问次数且没有任何产出的停留做惩罚，降低来回抖动和空转。
-        if cleaned_this_step == 0 and new_explored_cells == 0 and current_visit >= 6:
-            reward -= 0.003 * min(current_visit - 5, 6) * profile["idle_penalty_scale"]
+        # 对“原地不动 / 无效站桩”做强惩罚。
+        #
+        # 这里的设计目标不是“轻轻提醒别空转”，而是明确告诉策略：
+        # 1. 只要连续站在同一个格子却没有任何有效收益，就应被视为严重负样本；
+        # 2. 越是低电量、回桩中、近桩阶段，站桩越危险，惩罚必须进一步放大；
+        # 3. 真正进入充电恢复期时，应允许短暂停留，避免把“正在成功充电”误罚成坏行为。
+        charging_recovery = bool(
+            charged_this_step
+            or (
+                target_dist is not None
+                and int(target_dist) <= 1
+                and battery_ratio >= 0.92
+                and self.remaining_charge >= self.prev_remaining_charge
+            )
+        )
+        if cleaned_this_step == 0 and new_explored_cells == 0 and current_visit >= 2:
+            idle_severity = min(current_visit - 1, 10)
+            idle_penalty = (0.010 + 0.008 * idle_severity) * profile["idle_penalty_scale"]
+
+            if charging_recovery:
+                # 充电刚成功或已明显处于充电恢复态时，大幅减轻站桩惩罚，
+                # 避免模型把“停在桩上补能”也学成错误行为。
+                idle_penalty *= 0.12
+            else:
+                if should_return or low_battery:
+                    idle_penalty *= 1.6
+                if dock_mode:
+                    idle_penalty *= 1.8
+                if target_dist is not None and int(target_dist) <= 2:
+                    idle_penalty *= 1.5
+                if first_charge_phase:
+                    idle_penalty *= 1.2
+
+            reward -= idle_penalty
 
         # 充电成功一定要比普通局部收益高很多，否则策略会更倾向“继续赌几步清扫”。
         if charged_this_step:

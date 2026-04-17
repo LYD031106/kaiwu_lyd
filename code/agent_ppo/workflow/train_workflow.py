@@ -118,7 +118,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     1. 读取环境配置。
     2. 构造 `EpisodeRunner`。
     3. 持续消费 runner 产出的样本并发送给 learner。
-    4. 按固定时间间隔自动保存模型。
+    4. 按固定时间间隔触发一次标准模型保存。
     """
     last_save_model_time = time.time()
     env = envs[0]
@@ -725,7 +725,7 @@ class EpisodeRunner:
         持续运行 episode，并在每局结束后产出一批训练样本。
 
         这是训练主循环：
-        1. 重置环境，载入最新模型。
+        1. 重置环境，并在 episode 开始时尝试同步最新模型参数。
         2. 持续执行 `obs -> act -> env.step -> next_obs`。
         3. 收集 shaped reward 和 value/prob 等训练字段。
         4. 在终局时补发 final reward，并输出核心监控指标。
@@ -746,7 +746,8 @@ class EpisodeRunner:
             if handle_disaster_recovery(env_obs, self.logger):
                 continue
 
-            # 每局开始都重新加载一次最新模型，确保 actor 侧尽快跟上 learner 已更新的参数。
+            # 每局开始都尝试同步一次最新模型参数；若当前运行环境未提供可用 checkpoint，
+            # `Agent.load_model()` 会自行跳过，不影响 episode 正常启动。
             self.agent.reset(env_obs)
             self.agent.load_model(id="latest")
             active_stage_info = self.agent.get_training_stage()
