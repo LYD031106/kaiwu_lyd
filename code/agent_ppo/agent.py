@@ -222,9 +222,25 @@ class Agent(BaseAgent):
         从 checkpoint 加载模型参数。
 
         如果最新 checkpoint 与当前 baseline 结构不兼容，则跳过加载，避免训练直接中断。
+        如果 Config.LOAD_MODEL_SWITCH 设置为 False，则不加载任何模型。
         """
-        model_file_path = f"{path}/model.ckpt-{id}.pkl"
-        if not path or not os.path.exists(model_file_path):
+        # 由于训练在每个 episode 都会尝试 load_model(id="latest")
+        # 记录日志会刷屏，这里如果是不加载，可以改成 debug 级别，或者干脆不打日志
+        # 我们改成 logger.debug 以免它不断刷屏
+        if not Config.LOAD_MODEL_SWITCH:
+            self.logger.debug("skip loading model, LOAD_MODEL_SWITCH is False in Config.")
+            return
+
+        # 如果 Config.LOAD_MODEL_PATH 存在，则覆盖掉基于 path和id 拼接出的默认路径
+        if Config.LOAD_MODEL_PATH:
+            model_file_path = Config.LOAD_MODEL_PATH
+        else:
+            model_file_path = f"{path}/model.ckpt-{id}.pkl"
+            if not path:
+                 self.logger.warning(f"skip loading model {model_file_path}, checkpoint not found")
+                 return
+
+        if not os.path.exists(model_file_path):
             self.logger.warning(f"skip loading model {model_file_path}, checkpoint not found")
             return
 

@@ -38,5 +38,7 @@ class Config:
     LABEL_SIZE_LIST = [ACTION_NUM]
     LEGAL_ACTION_SIZE_LIST = LABEL_SIZE_LIST.copy()
 
-    USE_GRAD_CLIP = True
-    GRAD_CLIP_RANGE = 0.5
+    # 训练模型加载控制
+    LOAD_MODEL_SWITCH = False  # 是否开启读取 checkpoint 的逻辑
+    LOAD_MODEL_PATH = ""  # 读取的 checkpoint 文件名路径 (如果为空且开关为True，则走原本的 default path)
+

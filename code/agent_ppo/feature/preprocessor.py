@@ -90,10 +90,10 @@ class Preprocessor:
             "explore_gain_scale": 0.65,
             "idle_penalty_scale": 0.75,
             "charge_gain_scale": 1.35,
-            "return_progress_scale": 1.25,
-            "return_risk_penalty_scale": 1.30,
+            "return_progress_scale": 1.80,  # [修改] 1.25 -> 1.80 大幅增加回程前进的诱惑力
+            "return_risk_penalty_scale": 1.40, # [修改] 1.30 -> 1.40
             "cycle_quality_scale": 0.75,
-            "first_charge_deadline_scale": 1.25,
+            "first_charge_deadline_scale": 1.50, # [修改] 1.25 -> 1.50 增加回充紧迫感
         },
         "middle": {
             "base_step_cost_scale": 1.00,
@@ -2773,6 +2773,13 @@ class Preprocessor:
             if route_progress is not None:
                 progress_scale = (0.040 if dock_mode else 0.036) * profile["return_progress_scale"]
                 regress_scale = (0.060 if dock_mode else 0.055) * profile["return_risk_penalty_scale"]
+
+                # [新增] 近桩密集激励：距离小于等于 5 时，前进奖励和后退惩罚呈线性翻倍，最大约 2.5 倍
+                if target_dist is not None and int(target_dist) <= 5:
+                    dist_bonus = 1.0 + 0.3 * (6 - int(target_dist))
+                    progress_scale *= dist_bonus
+                    regress_scale *= dist_bonus
+
                 if route_progress > 0:
                     reward += progress_scale * min(route_progress, 2.0)
                 elif route_progress < 0:
@@ -2795,15 +2802,19 @@ class Preprocessor:
                 reward -= 0.0035 * profile["return_risk_penalty_scale"]
 
             if stall_steps >= 2:
-                reward -= 0.010 * min(stall_steps, 6) * profile["return_risk_penalty_scale"]
+                # [修改] 加重卡顿惩罚 (0.010 -> 0.015)
+                reward -= 0.015 * min(stall_steps, 6) * profile["return_risk_penalty_scale"]
                 if dock_mode:
-                    reward -= 0.005 * min(stall_steps, 4) * profile["return_risk_penalty_scale"]
+                    # [修改] 贴桩阶段卡顿更是翻倍惩罚 (0.005 -> 0.015)
+                    reward -= 0.015 * min(stall_steps, 4) * profile["return_risk_penalty_scale"]
 
             if dock_mode and target_dist is not None and int(target_dist) <= 1 and not charged_this_step:
-                reward -= 0.055 * profile["return_risk_penalty_scale"]
+                # [修改] 贴桩不充的极刑惩罚 (0.055 -> 0.080)，逼迫它必须对接！
+                reward -= 0.080 * profile["return_risk_penalty_scale"]
             elif dock_mode and target_dist is not None and int(target_dist) <= 2:
                 if route_progress is not None and route_progress <= 0:
-                    reward -= 0.015 * profile["return_risk_penalty_scale"]
+                    # [修改] 近桩还敢退步/原地的惩罚 (0.015 -> 0.040)
+                    reward -= 0.040 * profile["return_risk_penalty_scale"]
 
         # 当已经非常接近回桩阈值却还没进入回桩模式时，也给一个轻微警告，
         # 让策略逐步学会“不要把安全余量耗到极限再回”。
