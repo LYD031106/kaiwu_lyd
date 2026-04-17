@@ -2733,6 +2733,9 @@ class Preprocessor:
         stall_steps = int(guidance.get("charge_stall_steps", 0))
         profile = self.training_stage_profile
 
+        # 核心电量比例，用于动态调节充电奖励和驱逐惩罚。
+        battery_ratio = float(self.remaining_charge) / float(max(self.battery_max, 1))
+
         # 统一的轻微生存成本，避免策略通过无意义拖时长白拿零奖励。
         reward = -0.0025 * profile["base_step_cost_scale"]
 
@@ -2748,7 +2751,19 @@ class Preprocessor:
 
         # 充电成功一定要比普通局部收益高很多，否则策略会更倾向“继续赌几步清扫”。
         if charged_this_step:
-            reward += 1.30 * profile["charge_gain_scale"]
+            # [核心改进] 充电奖励应随当前剩余电量动态衰减。
+            # 1. 只有当确实需要充电（如低于 90%）时，才给予显著的正向奖励。
+            # 2. 如果电量已经非常充足甚至已经满了，则不再给予持续充电奖励，
+            #    避免模型学会“赖在充电桩上不出门刷分”的行为。
+            charge_incentive = 1.0
+            if battery_ratio >= 0.98:
+                charge_incentive = 0.0   # 电已基本满，不再提供任何奖励，由 idle penalty 接管
+            elif battery_ratio >= 0.85:
+                charge_incentive = 0.12  # 电量较足，只给很小的引导奖励
+            elif battery_ratio >= 0.60:
+                charge_incentive = 0.50  # 电量中等，给予中等奖励
+
+            reward += 1.30 * charge_incentive * profile["charge_gain_scale"]
             if first_charge_success:
                 reward += 1.10 * profile["charge_gain_scale"]
                 if self.step_no <= 220:
@@ -2820,6 +2835,13 @@ class Preprocessor:
         # 让策略逐步学会“不要把安全余量耗到极限再回”。
         elif battery_margin is not None and battery_margin <= activation_buffer + 4 and not charged_this_step:
             reward -= 0.006 * profile["return_risk_penalty_scale"]
+
+        # [新增] 反向驱逐激励：当电量充足且处于非回桩模式时，若模型仍然死守在充电桩附近（可能是因为之前刷分的惯性），
+        # 给出显著惩罚，强制其离开桩位去执行清扫任务。
+        elif not should_return and not low_battery and battery_ratio >= 0.85:
+            if target_dist is not None and int(target_dist) <= 2:
+                # 惩罚力度要足以抵消可能的误触奖励，逼迫模型“出港”
+                reward -= 0.035 * profile["clean_gain_scale"]
 
         # 首充阶段额外强调“及时回去并充上”，这是当前最优先提升的训练目标。
         if first_charge_phase:
