@@ -153,8 +153,11 @@ class Preprocessor:
         self.prev_remaining_charge = 200
 
         self.cur_pos = (0, 0)
+        self.prev_pos = (0, 0)
         self.last_action = -1
         self.prev_action = -1
+        self._idle_still_steps = 0
+        self._dock_idle_tolerance_steps = 0
 
         self.dirt_cleaned = 0
         self.last_dirt_cleaned = 0
@@ -528,6 +531,7 @@ class Preprocessor:
 
         self.step_no = int(observation.get("step_no", env_info.get("step_no", self.step_no)))
         self.max_step = max(int(env_info.get("max_step", self.max_step)), 1)
+        self.prev_pos = self.cur_pos
         self.cur_pos = hero_pos
         self.prev_action = self.last_action
         self.last_action = last_action
@@ -2118,7 +2122,6 @@ class Preprocessor:
             target_pos = locked_target
             quick_dist = self._chebyshev_dist(self.cur_pos, locked_target)
         soft_radius, hard_radius = self._get_cleaning_radius_limits()
-
         hx, hz = self.cur_pos
         current_visit = 0
         if 0 <= hx < self.GRID_SIZE and 0 <= hz < self.GRID_SIZE:
@@ -2777,11 +2780,6 @@ class Preprocessor:
         low_battery = bool(battery_margin is not None and battery_margin <= low_battery_threshold)
         critical_battery = bool(battery_margin is not None and battery_margin < 0)
 
-        hx, hz = self.cur_pos
-        current_visit = 0
-        if 0 <= hx < self.GRID_SIZE and 0 <= hz < self.GRID_SIZE:
-            current_visit = int(self.visit_count[hx, hz])
-
         route_progress = None
         if self.last_charger_route_dist < 200.0 and self.charger_route_dist < 200.0:
             route_progress = float(self.last_charger_route_dist - self.charger_route_dist)
@@ -2804,6 +2802,13 @@ class Preprocessor:
         reward += 0.08 * cleaned_this_step * clean_scale * profile["clean_gain_scale"]
         reward += 0.0035 * min(new_explored_cells, 6) * explore_scale * profile["explore_gain_scale"]
 
+        position_unchanged = bool(self.cur_pos == self.prev_pos)
+        gained_progress_this_step = bool(cleaned_this_step > 0 or new_explored_cells > 0 or charged_this_step)
+        if position_unchanged and not gained_progress_this_step:
+            self._idle_still_steps += 1
+        else:
+            self._idle_still_steps = 0
+
         # 对“原地不动 / 无效站桩”做强惩罚。
         #
         # 这里的设计目标不是“轻轻提醒别空转”，而是明确告诉策略：
@@ -2819,25 +2824,45 @@ class Preprocessor:
                 and self.remaining_charge >= self.prev_remaining_charge
             )
         )
-        if cleaned_this_step == 0 and new_explored_cells == 0 and current_visit >= 2:
-            idle_severity = min(current_visit - 1, 10)
-            idle_penalty = (0.010 + 0.008 * idle_severity) * profile["idle_penalty_scale"]
+        dock_contact_like_state = bool(
+            dock_mode and target_dist is not None and int(target_dist) <= 2 and not charged_this_step
+        )
+        if dock_contact_like_state and route_progress is not None and route_progress > 0:
+            self._dock_idle_tolerance_steps = 0
+        elif dock_contact_like_state:
+            self._dock_idle_tolerance_steps += 1
+        else:
+            self._dock_idle_tolerance_steps = 0
 
-            if charging_recovery:
-                # 充电刚成功或已明显处于充电恢复态时，大幅减轻站桩惩罚，
-                # 避免模型把“停在桩上补能”也学成错误行为。
-                idle_penalty *= 0.12
-            else:
-                if should_return or low_battery:
-                    idle_penalty *= 1.6
-                if dock_mode:
-                    idle_penalty *= 1.8
-                if target_dist is not None and int(target_dist) <= 2:
-                    idle_penalty *= 1.5
-                if first_charge_phase:
-                    idle_penalty *= 1.2
+        # 新版 idle 惩罚只针对“连续未位移且没有任何有效收益”的真实空转。
+        # 近桩阶段允许少量对齐/等待步，避免把末端贴桩学习误伤成坏样本。
+        if self._idle_still_steps >= 2:
+            effective_idle_steps = self._idle_still_steps
+            if dock_contact_like_state:
+                effective_idle_steps = max(0, self._idle_still_steps - 2)
+                effective_idle_steps = min(effective_idle_steps, self._dock_idle_tolerance_steps - 2)
 
-            reward -= idle_penalty
+            if effective_idle_steps > 0:
+                idle_severity = min(effective_idle_steps, 8)
+                idle_penalty = (0.006 + 0.006 * idle_severity) * profile["idle_penalty_scale"]
+
+                if charging_recovery:
+                    # 充电恢复态几乎不罚站桩，避免模型把“正在补能”学坏。
+                    idle_penalty *= 0.08
+                else:
+                    if should_return or low_battery:
+                        idle_penalty *= 1.25
+                    if first_charge_phase:
+                        idle_penalty *= 1.10
+                    if dock_contact_like_state:
+                        # 近桩接触阶段只保留轻惩罚，主要失败信号交给 stall/regress/contact fail。
+                        idle_penalty *= 0.35
+                    elif dock_mode:
+                        idle_penalty *= 0.80
+                    elif target_dist is not None and int(target_dist) <= 2:
+                        idle_penalty *= 0.65
+
+                reward -= idle_penalty
 
         # 充电成功一定要比普通局部收益高很多，否则策略会更倾向“继续赌几步清扫”。
         if charged_this_step:

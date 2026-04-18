@@ -282,11 +282,27 @@ def _build_episode_metrics(result_details):
     """
     snapshot = result_details["snapshot"]
     low_battery_route_progress_mean = snapshot.get("low_battery_route_progress_mean")
+    charge_guidance_steps = int(snapshot["charge_guidance_steps"])
+    charge_route_found_steps = int(snapshot["charge_route_found_steps"])
+    route_stall_steps_total = int(snapshot["route_stall_steps_total"])
+    near_dock_entries = int(snapshot.get("near_dock_entries", 0))
+    dock_contact_entries = int(snapshot.get("dock_contact_entries", 0))
+    charge_count = int(result_details["charge_count"])
+    first_charge_success = float(result_details["first_charge_success"])
+    battery_depleted = float(result_details["battery_depleted"])
+    effective_return_steps = max(charge_guidance_steps, 1)
+    return_stall_rate = float(route_stall_steps_total) / float(effective_return_steps)
+    return_progress_quality = float(charge_route_found_steps - route_stall_steps_total) / float(effective_return_steps)
+    near_dock_no_contact = float(near_dock_entries > 0 and dock_contact_entries <= 0)
+    return_without_near_dock = float(charge_guidance_steps > 0 and near_dock_entries <= 0)
+    post_first_charge_battery_depleted = float(first_charge_success > 0.0 and battery_depleted > 0.0)
+    single_charge_then_fail = float(charge_count == 1 and not result_details["is_completed"])
+    multi_charge_rate = float(charge_count >= 2)
     return {
         "clean_ratio": float(result_details["clean_ratio"]),
-        "charge_count": int(result_details["charge_count"]),
-        "first_charge_success": float(result_details["first_charge_success"]),
-        "battery_depleted": float(result_details["battery_depleted"]),
+        "charge_count": charge_count,
+        "first_charge_success": first_charge_success,
+        "battery_depleted": battery_depleted,
         "remaining_charge": int(result_details["remaining_charge"]),
         "completed": float(result_details["is_completed"]),
         "explored_ratio": float(snapshot["explored_ratio"]),
@@ -314,17 +330,24 @@ def _build_episode_metrics(result_details):
             0.0 if low_battery_route_progress_mean is None else float(low_battery_route_progress_mean)
         ),
         "charge_route_found_rate": float(snapshot["charge_route_found_rate"]),
-        "route_stall_steps_total": int(snapshot["route_stall_steps_total"]),
+        "route_stall_steps_total": route_stall_steps_total,
         "max_charge_stall_steps": int(snapshot["max_charge_stall_steps"]),
         "dock_contact_without_charge": int(snapshot["dock_contact_without_charge"]),
-        "near_dock_entries": int(snapshot.get("near_dock_entries", 0)),
-        "dock_contact_entries": int(snapshot.get("dock_contact_entries", 0)),
+        "near_dock_entries": near_dock_entries,
+        "dock_contact_entries": dock_contact_entries,
         "dock_success_after_contact_count": int(snapshot.get("dock_success_after_contact_count", 0)),
         "charge_success_after_dock_step_sum": int(snapshot.get("charge_success_after_dock_step_sum", 0)),
         "dock_stall_steps_total": int(snapshot.get("dock_stall_steps_total", 0)),
         "dock_regress_count": int(snapshot.get("dock_regress_count", 0)),
-        "charge_guidance_steps": int(snapshot["charge_guidance_steps"]),
-        "charge_route_found_steps": int(snapshot["charge_route_found_steps"]),
+        "charge_guidance_steps": charge_guidance_steps,
+        "charge_route_found_steps": charge_route_found_steps,
+        "return_stall_rate": return_stall_rate,
+        "return_progress_quality": return_progress_quality,
+        "near_dock_no_contact": near_dock_no_contact,
+        "return_without_near_dock": return_without_near_dock,
+        "post_first_charge_battery_depleted": post_first_charge_battery_depleted,
+        "single_charge_then_fail": single_charge_then_fail,
+        "multi_charge_rate": multi_charge_rate,
     }
 
 
@@ -521,6 +544,13 @@ class EpisodeRunner:
             "route_stall_steps_total": int(metrics["route_stall_steps_total"]),
             "charge_guidance_steps": int(metrics["charge_guidance_steps"]),
             "charge_route_found_steps": int(metrics["charge_route_found_steps"]),
+            "return_stall_rate": float(metrics["return_stall_rate"]),
+            "return_progress_quality": float(metrics["return_progress_quality"]),
+            "near_dock_no_contact": float(metrics["near_dock_no_contact"]),
+            "return_without_near_dock": float(metrics["return_without_near_dock"]),
+            "post_first_charge_battery_depleted": float(metrics["post_first_charge_battery_depleted"]),
+            "single_charge_then_fail": float(metrics["single_charge_then_fail"]),
+            "multi_charge_rate": float(metrics["multi_charge_rate"]),
             "fail_reason": str(result_details["fail_reason"]),
         }
 
@@ -546,6 +576,13 @@ class EpisodeRunner:
                 "charge_success_after_dock_step_mean": 0.0,
                 "route_stall_steps_total_mean": 0.0,
                 "charge_route_found_rate_weighted": 0.0,
+                "return_stall_rate_mean": 0.0,
+                "return_progress_quality_mean": 0.0,
+                "near_dock_no_contact_rate": 0.0,
+                "return_without_near_dock_rate": 0.0,
+                "post_first_charge_battery_depleted_rate": 0.0,
+                "single_charge_then_fail_rate": 0.0,
+                "multi_charge_rate": 0.0,
                 "npc_collision_rate": 0.0,
                 "abnormal_truncated_rate": 0.0,
                 "unknown_failure_rate": 0.0,
@@ -614,6 +651,23 @@ class EpisodeRunner:
                 else 0.0,
                 4,
             ),
+            "return_stall_rate_mean": round(self._mean([record["return_stall_rate"] for record in records]), 4),
+            "return_progress_quality_mean": round(
+                self._mean([record["return_progress_quality"] for record in records]), 4
+            ),
+            "near_dock_no_contact_rate": round(
+                self._mean([record["near_dock_no_contact"] for record in records]), 4
+            ),
+            "return_without_near_dock_rate": round(
+                self._mean([record["return_without_near_dock"] for record in records]), 4
+            ),
+            "post_first_charge_battery_depleted_rate": round(
+                self._mean([record["post_first_charge_battery_depleted"] for record in records]), 4
+            ),
+            "single_charge_then_fail_rate": round(
+                self._mean([record["single_charge_then_fail"] for record in records]), 4
+            ),
+            "multi_charge_rate": round(self._mean([record["multi_charge_rate"] for record in records]), 4),
             "npc_collision_rate": round(
                 sum(1 for record in records if record["fail_reason"] == "npc_collision") / float(episode_count),
                 4,

@@ -140,6 +140,101 @@ class Agent(BaseAgent):
         remain_info = {}
         return obs_data, remain_info
 
+    def _build_charge_bias_context(self):
+        """
+        从预处理器调试快照提取轻量回桩 bias 所需上下文。
+
+        这里刻意只读取已经存在的 guidance/debug 字段，不引入新的策略状态耦合：
+        1. `target_action`：当前回桩建议动作；
+        2. `return_mode / dock_mode`：决定是否启用 bias 以及力度上限；
+        3. `charge_urgency / nearest_charger_dist / charge_stall_steps`：用于动态控制 bias 强弱。
+
+        返回 `None` 表示当前不施加任何额外偏置。
+        """
+        snapshot = self.preprocessor.get_debug_snapshot()
+        if not snapshot.get("return_mode"):
+            return None
+
+        target_action = snapshot.get("charge_action")
+        if target_action is None:
+            return None
+
+        return {
+            "target_action": int(target_action),
+            "return_mode": bool(snapshot.get("return_mode")),
+            "dock_mode": bool(snapshot.get("dock_mode")),
+            "urgency": float(snapshot.get("charge_urgency", 0.0)),
+            "nearest_charger_dist": snapshot.get("nearest_charger_dist"),
+            "charge_stall_steps": int(snapshot.get("charge_stall_steps", 0)),
+            "route_progress_delta": snapshot.get("charge_route_progress_delta"),
+            "route_reliable": bool(snapshot.get("charge_route_reliable", False)),
+            "first_charge_phase": bool(snapshot.get("first_charge_phase", False)),
+        }
+
+    def _apply_charge_action_bias(self, prob, legal_action, bias_ctx):
+        """
+        对策略分布施加轻量回桩 bias。
+
+        设计原则：
+        1. 不直接覆盖策略动作，只做概率重加权；
+        2. 越接近近桩、越紧急、越卡顿时，越鼓励跟随 `target_action`；
+        3. 保留一定探索空间，避免彻底退化成规则控制。
+        """
+        if not bias_ctx:
+            return prob
+
+        legal_arr = np.asarray(legal_action, dtype=np.float32)
+        target_action = int(bias_ctx["target_action"])
+        if target_action < 0 or target_action >= len(prob) or legal_arr[target_action] <= 0:
+            return prob
+
+        biased_prob = np.asarray(prob, dtype=np.float64).copy()
+        urgency = float(np.clip(bias_ctx.get("urgency", 0.0), 0.0, 1.0))
+        stall_steps = int(max(bias_ctx.get("charge_stall_steps", 0), 0))
+        nearest_charger_dist = bias_ctx.get("nearest_charger_dist")
+        route_progress_delta = bias_ctx.get("route_progress_delta")
+        dock_mode = bool(bias_ctx.get("dock_mode", False))
+        first_charge_phase = bool(bias_ctx.get("first_charge_phase", False))
+        route_reliable = bool(bias_ctx.get("route_reliable", False))
+
+        target_boost = 1.0 + 0.18 + 0.32 * urgency
+        if dock_mode:
+            target_boost += 0.22
+        if first_charge_phase:
+            target_boost += 0.10
+        if stall_steps >= 2:
+            target_boost += min(0.18, 0.04 * float(stall_steps - 1))
+        if nearest_charger_dist is not None and int(nearest_charger_dist) <= 3:
+            target_boost += 0.20
+        elif nearest_charger_dist is not None and int(nearest_charger_dist) <= 6:
+            target_boost += 0.10
+        if route_progress_delta is not None and float(route_progress_delta) <= 0.0:
+            target_boost += 0.12
+        if not route_reliable:
+            target_boost += 0.06
+
+        target_boost = min(target_boost, 2.10)
+        biased_prob[target_action] *= target_boost
+
+        # 在 near-dock 或明显卡顿时，适度压低“非目标动作”的权重，减少绕圈和来回抖动。
+        suppress_scale = 1.0
+        if dock_mode:
+            suppress_scale *= 0.92
+        if stall_steps >= 2:
+            suppress_scale *= 0.94
+        if nearest_charger_dist is not None and int(nearest_charger_dist) <= 3:
+            suppress_scale *= 0.92
+        if route_progress_delta is not None and float(route_progress_delta) < 0.0:
+            suppress_scale *= 0.95
+
+        if suppress_scale < 0.999:
+            for idx in range(len(biased_prob)):
+                if idx != target_action and legal_arr[idx] > 0:
+                    biased_prob[idx] *= suppress_scale
+
+        biased_prob = self._sanitize_prob(biased_prob, legal_arr, fallback=prob)
+        return biased_prob.astype(np.float32)
+
     def action_process(self, act_data, is_stochastic=True):
         """
         从 `ActData` 中取出本次真正要提交给环境的动作。
@@ -175,27 +270,31 @@ class Agent(BaseAgent):
         logits, value = self._run_model(feature)
         legal_arr = np.array(legal_action, dtype=np.float32)
         prob = self._legal_soft_max(logits, legal_arr)
+        charge_bias_ctx = self._build_charge_bias_context()
+        biased_prob = self._apply_charge_action_bias(prob, legal_arr, charge_bias_ctx)
 
         # 训练用采样动作，评估可切到贪心动作。
-        action = self._legal_sample(prob, use_max=False)
-        d_action = self._legal_sample(prob, use_max=True)
+        action = self._legal_sample(biased_prob, use_max=False)
+        d_action = self._legal_sample(biased_prob, use_max=True)
         # 调试字段显式保留 sampled / greedy / selected 三层动作，
         # 方便在终局日志里区分“策略本来想怎么走”和“最后真正提交了什么动作”。
         self.last_action_debug = {
-            "source": "policy_only",
-            "used_charge_rule": False,
-            "deterministic_action": None,
+            "source": "policy_charge_bias" if charge_bias_ctx else "policy_only",
+            "used_charge_rule": bool(charge_bias_ctx),
+            "deterministic_action": int(charge_bias_ctx["target_action"]) if charge_bias_ctx else None,
             "sampled_action": int(action),
             "greedy_action": int(d_action),
             "selected_action": None,
             "is_stochastic": True,
+            "charge_target_action": int(charge_bias_ctx["target_action"]) if charge_bias_ctx else None,
+            "charge_bias_urgency": float(charge_bias_ctx["urgency"]) if charge_bias_ctx else 0.0,
         }
 
         return [
             ActData(
                 action=[action],
                 d_action=[d_action],
-                prob=list(prob),
+                prob=list(biased_prob),
                 value=value,
             )
         ]
