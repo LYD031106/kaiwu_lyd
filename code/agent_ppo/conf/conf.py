@@ -1,32 +1,39 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
 ###########################################################################
-# Copyright 1998 - 2026 Tencent. All Rights Reserved.
+# Copyright © 1998 - 2026 Tencent. All Rights Reserved.
 ###########################################################################
 """
 Author: Tencent AI Arena Authors
 
 Configuration for Robot Vacuum PPO agent.
+清扫大作战 PPO 配置。
 """
 
 
 class Config:
-    LOCAL_VIEW_SIZE = 21 * 21
-    GLOBAL_FEATURE_SIZE = 38
 
-    # Full 21x21 local view + structured state + legal action mask
+    # Feature dimensions (69D)
+    # 特征维度（69D）
     FEATURES = [
-        LOCAL_VIEW_SIZE,
-        GLOBAL_FEATURE_SIZE,
+        7 * 7,
+        12,
         8,
     ]
     FEATURE_SPLIT_SHAPE = FEATURES
     FEATURE_LEN = sum(FEATURES)
     DIM_OF_OBSERVATION = FEATURE_LEN
 
+    # Action space: 8 directional moves
+    # 动作空间：8个方向移动
     ACTION_NUM = 8
+
+    # Single-head value
+    # 单头价值
     VALUE_NUM = 1
 
+    # PPO hyperparameters
+    # PPO 超参数
     GAMMA = 0.99
     LAMDA = 0.95
 
