@@ -132,6 +132,7 @@ class Algorithm:
         ratio = new_prob / old_action_prob.clamp(1e-9)
 
         adv = advantage.squeeze(-1) if advantage.dim() > 1 else advantage
+        adv = (adv - adv.mean()) / adv.std().clamp_min(1e-8)
         adv = adv.unsqueeze(-1)
 
         policy_loss = torch.maximum(
@@ -154,6 +155,8 @@ class Algorithm:
 
         对 logits 应用合法动作掩码后计算 softmax。
         """
+        if (legal_action.sum(dim=1) <= 0).any():
+            raise ValueError("legal_action contains all-zero row")
         label_max, _ = torch.max(logits * legal_action, dim=1, keepdim=True)
         logits = logits - label_max
         logits = logits * legal_action
