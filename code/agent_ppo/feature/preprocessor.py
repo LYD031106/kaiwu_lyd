@@ -14,6 +14,7 @@ import numpy as np
 
 from agent_ppo.reward.reward_charge import RewardCharge
 from agent_ppo.reward.reward_context import RewardContext
+from agent_ppo.reward.reward_explore import RewardExplore
 
 
 def _norm(v, v_max, v_min=0.0):
@@ -74,6 +75,7 @@ class Preprocessor:
         self.charge_dis_delta = 0  #0 代表更近 1 代表更远   
         self.charge_dir = np.zeros(8, dtype=np.float32)
         self.reward_charge = RewardCharge()
+        self.reward_explore = RewardExplore()
 
 
     def pb2struct(self, env_obs, last_action):
