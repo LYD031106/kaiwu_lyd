@@ -1,3 +1,6 @@
+from agent_ppo.reward.reward_context import RewardContext
+
+
 class RewardCharge:
     def __init__(self):
         self.reward_context = RewardContext()
