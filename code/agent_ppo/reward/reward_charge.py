@@ -26,4 +26,3 @@ class RewardCharge:
                 reward -= 0.5
 
         return reward
-        return reward

@@ -292,6 +292,7 @@ class Preprocessor:
         context.passable_map = np.array(self.passable_map, copy=True)
         context.nearest_dirt_dist = self.nearest_dirt_dist
         context.last_nearest_dirt_dist = self.last_nearest_dirt_dist
+        context.dirt_delta = float(global_state[11])
 
         context._view_map = np.array(self._view_map, copy=True)
         context._legal_act = list(self._legal_act)

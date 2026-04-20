@@ -43,6 +43,7 @@ class RewardContext:
         # 探索字段
         self.visit = np.zeros((self.GRID_SIZE, self.GRID_SIZE), dtype=np.int8)
         self.dur_visit = np.zeros((3, 3), dtype=np.int8)
+        self.dirt_delta = 0.0
 
         # 充电字段
         self.charge_distance = 200.0
