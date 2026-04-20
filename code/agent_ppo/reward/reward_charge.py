@@ -12,14 +12,14 @@ class RewardCharge:
         """
         reward = 0.0
         # 分阶段当电量在 50 以上 不会施加任何奖励
-        if context.battery >= 50:
+        if context.batter >= 30:
             pass
-        elif context.battery < 50 and context.battery > 30:
+        elif context.battery < 30 and context.battery > 15:
             if context.charge_dis_delta == 0:
                 reward += 0.3
             else:
-                reward -= 0.1
-        elif context.battery < 30:
+                reward -= 0.2
+        elif context.battery < 15:
             if context.charge_dis_delta == 0:
                 reward += 0.5
             else:
