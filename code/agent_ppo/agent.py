@@ -86,10 +86,14 @@ class Agent(BaseAgent):
         obs_data = list_obs_data[0]
         feature = obs_data.feature
         legal_action = obs_data.legal_action
+        feature_arr = np.asarray(feature, dtype=np.float32)
+        legal_arr = np.asarray(legal_action, dtype=np.float32)
 
-        logits, value = self._run_model(feature)
+        if feature_arr.size != Config.DIM_OF_OBSERVATION:
+            raise ValueError(f"feature dim mismatch, expect={Config.DIM_OF_OBSERVATION}, got={feature_arr.size}")
 
-        legal_arr = np.array(legal_action, dtype=np.float32)
+        logits, value = self._run_model(feature_arr)
+
         prob = self._legal_soft_max(logits, legal_arr)
         action = self._legal_sample(prob, use_max=False)
         d_action = self._legal_sample(prob, use_max=True)

@@ -140,9 +140,29 @@ class Preprocessor:
 
         局部视野特征（121D）：从 21×21 视野中心裁剪 11×11。
         """
-        center = self.VIEW_HALF
-        h = self.LOCAL_HALF
-        crop = self._view_map[center - h : center + h + 1, center - h : center + h + 1]
+        view = np.asarray(self._view_map, dtype=np.float32)
+        if view.ndim != 2:
+            view = np.zeros((2 * self.LOCAL_HALF + 1, 2 * self.LOCAL_HALF + 1), dtype=np.float32)
+
+        target_size = 2 * self.LOCAL_HALF + 1
+        h, w = view.shape
+        center_x = h // 2
+        center_z = w // 2
+
+        start_x = max(center_x - self.LOCAL_HALF, 0)
+        end_x = min(center_x + self.LOCAL_HALF + 1, h)
+        start_z = max(center_z - self.LOCAL_HALF, 0)
+        end_z = min(center_z + self.LOCAL_HALF + 1, w)
+
+        crop = view[start_x:end_x, start_z:end_z]
+
+        if crop.shape != (target_size, target_size):
+            padded = np.zeros((target_size, target_size), dtype=np.float32)
+            offset_x = (target_size - crop.shape[0]) // 2
+            offset_z = (target_size - crop.shape[1]) // 2
+            padded[offset_x : offset_x + crop.shape[0], offset_z : offset_z + crop.shape[1]] = crop
+            crop = padded
+
         return (crop / 2.0).flatten()
 
     def _get_view_cell(self, x, z, hx, hz):
@@ -153,9 +173,13 @@ class Preprocessor:
         if self._view_map is None:
             return 0
 
-        view_x = x - hx + self.VIEW_HALF
-        view_z = z - hz + self.VIEW_HALF
-        if not (0 <= view_x < 21 and 0 <= view_z < 21):
+        view_h, view_w = self._view_map.shape[:2]
+        center_x = view_h // 2
+        center_z = view_w // 2
+
+        view_x = x - hx + center_x
+        view_z = z - hz + center_z
+        if not (0 <= view_x < view_h and 0 <= view_z < view_w):
             return 0
 
         return int(self._view_map[view_x, view_z])
@@ -264,8 +288,9 @@ class Preprocessor:
         dirt_coords = np.argwhere(view == 2)
         if len(dirt_coords) == 0:
             return 200.0
-        center = self.VIEW_HALF
-        dists = np.sqrt((dirt_coords[:, 0] - center) ** 2 + (dirt_coords[:, 1] - center) ** 2)
+        center_x = view.shape[0] // 2
+        center_z = view.shape[1] // 2
+        dists = np.sqrt((dirt_coords[:, 0] - center_x) ** 2 + (dirt_coords[:, 1] - center_z) ** 2)
         return float(np.min(dists))
 
     def get_legal_action(self):
@@ -321,6 +346,12 @@ class Preprocessor:
         legal_arr = np.array(legal_action, dtype=np.float32)
 
         feature = np.concatenate([local_view, global_state, legal_arr])  # 141D
+        if feature.shape[0] != 141:
+            raise ValueError(
+                f"feature_process produced invalid dim={feature.shape[0]}, "
+                f"local_view_shape={self._view_map.shape if self._view_map is not None else None}, "
+                f"local_feature_dim={local_view.shape[0]}, global_dim={global_state.shape[0]}, legal_dim={legal_arr.shape[0]}"
+            )
 
         reward_context = self._build_reward_context(local_view, global_state, legal_action, legal_arr, feature)
         reward = self.reward_process(reward_context)
