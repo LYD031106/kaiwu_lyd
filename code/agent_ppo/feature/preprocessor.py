@@ -12,6 +12,9 @@ Feature preprocessor for Robot Vacuum.
 
 import numpy as np
 
+from agent_ppo.reward.reward_charge import RewardCharge
+from agent_ppo.reward.reward_context import RewardContext
+
 
 def _norm(v, v_max, v_min=0.0):
     """Normalize value to [0, 1].
@@ -31,8 +34,8 @@ class Preprocessor:
     """
 
     GRID_SIZE = 128
-    VIEW_HALF = 10  # Full local view radius (21×21) / 完整局部视野半径
-    LOCAL_HALF = 3  # Cropped view radius (7×7) / 裁剪后的视野半径
+    VIEW_HALF = 21  # Full local view radius (21×21) / 完整局部视野半径
+    LOCAL_HALF = 5  # Cropped view radius (11×11) / 裁剪后的视野半径
 
     def __init__(self):
         self.reset()
@@ -63,6 +66,15 @@ class Preprocessor:
 
         self._view_map = np.zeros((21, 21), dtype=np.float32)
         self._legal_act = [1] * 8
+
+        # 自己维护的指标 用于reward构造
+        # 最近的充电桩距离
+        self.last_charge_distance = 200.0
+        self.charge_distance = 200.0
+        self.charge_dis_delta = 0  #0 代表更近 1 代表更远   
+        self.charge_dir = np.zeros(8, dtype=np.float32)
+        self.reward_charge = RewardCharge()
+
 
     def pb2struct(self, env_obs, last_action):
         """Parse and cache essential fields from observation dict.
@@ -96,6 +108,13 @@ class Preprocessor:
             hx, hz = self.cur_pos
             self._update_passable(hx, hz)
 
+    def _get_nearest_dir(self):
+        """Placeholder for nearest-direction helper.
+
+        最近方向辅助函数预留接口。
+        """
+        return None
+
     def _update_passable(self, hx, hz):
         """Write local view into global passable map.
 
@@ -115,14 +134,68 @@ class Preprocessor:
                     self.passable_map[gx, gz] = 1 if view[ri, ci] != 0 else 0
 
     def _get_local_view_feature(self):
-        """Local view feature (49D): crop center 7×7 from 21×21.
+        """Local view feature (121D): crop center 11×11 from 21×21.
 
-        局部视野特征（49D）：从 21×21 视野中心裁剪 7×7。
+        局部视野特征（121D）：从 21×21 视野中心裁剪 11×11。
         """
         center = self.VIEW_HALF
         h = self.LOCAL_HALF
         crop = self._view_map[center - h : center + h + 1, center - h : center + h + 1]
         return (crop / 2.0).flatten()
+
+    def _get_view_cell(self, x, z, hx, hz):
+        """Get cell value from local view by global coordinate.
+
+        根据全局坐标读取局部视野中的格子值。
+        """
+        if self._view_map is None:
+            return 0
+
+        view_x = x - hx + self.VIEW_HALF
+        view_z = z - hz + self.VIEW_HALF
+        if not (0 <= view_x < 21 and 0 <= view_z < 21):
+            return 0
+
+        return int(self._view_map[view_x, view_z])
+
+    def _calc_ray_dirt_features(self, hx, hz, max_ray=30):
+        """Find normalized nearest dirt distance along 8 rays.
+
+        计算八方向射线上最近污渍距离，并归一化。
+        """
+        ray_dirs = [
+            (0, -1),
+            (1, 0),
+            (0, 1),
+            (-1, 0),
+        ]  # N E S W
+        ray_dirt = []
+
+        for dx, dz in ray_dirs:
+            x, z = hx, hz
+            found = max_ray
+            for step in range(1, max_ray + 1):
+                x += dx
+                z += dz
+                if not (0 <= x < self.GRID_SIZE and 0 <= z < self.GRID_SIZE):
+                    break
+                if self._get_view_cell(x, z, hx, hz) == 2:
+                    found = step
+                    break
+            ray_dirt.append(_norm(found, max_ray))
+
+        return ray_dirt
+
+    def _update_nearest_dirt_metrics(self):
+        """Update nearest dirt distance and approaching indicator.
+
+        更新最近污渍距离及是否接近污渍标记。
+        """
+        self.last_nearest_dirt_dist = self.nearest_dirt_dist
+        self.nearest_dirt_dist = self._calc_nearest_dirt_dist()
+        nearest_dirt_norm = _norm(self.nearest_dirt_dist, 180)
+        dirt_delta = 1.0 if self.nearest_dirt_dist < self.last_nearest_dirt_dist else 0.0
+        return nearest_dirt_norm, dirt_delta
 
     def _get_global_state_feature(self):
         """Global state feature (12D).
@@ -153,40 +226,12 @@ class Preprocessor:
         pos_z_norm = _norm(hz, self.GRID_SIZE)
 
         # 4-directional ray to find nearest dirt
-        # 四方向射线找最近污渍距离
-        ray_dirs = [(0, -1), (1, 0), (0, 1), (-1, 0)]  # N E S W
-        ray_dirt = []
-        max_ray = 30
-        for dx, dz in ray_dirs:
-            x, z = hx, hz
-            found = max_ray
-            for step in range(1, max_ray + 1):
-                x += dx
-                z += dz
-                if not (0 <= x < self.GRID_SIZE and 0 <= z < self.GRID_SIZE):
-                    break
-                if self._view_map is not None:
-                    cell = (
-                        int(
-                            self._view_map[
-                                np.clip(x - (hx - self.VIEW_HALF), 0, 20), np.clip(z - (hz - self.VIEW_HALF), 0, 20)
-                            ]
-                        )
-                        if (0 <= x - hx + self.VIEW_HALF < 21 and 0 <= z - hz + self.VIEW_HALF < 21)
-                        else 0
-                    )
-                    if cell == 2:
-                        found = step
-                        break
-            ray_dirt.append(_norm(found, max_ray))
+        # 四方向射线找最近污渍距离 
+        ray_dirt = self._calc_ray_dirt_features(hx, hz)
 
-        # Nearest dirt Euclidean distance (estimated from 7×7 crop)
-        # 最近污渍欧氏距离（视野内 7×7 粗估）
-        self.last_nearest_dirt_dist = self.nearest_dirt_dist
-        self.nearest_dirt_dist = self._calc_nearest_dirt_dist()
-        nearest_dirt_norm = _norm(self.nearest_dirt_dist, 180)
-
-        dirt_delta = 1.0 if self.nearest_dirt_dist < self.last_nearest_dirt_dist else 0.0
+        # Nearest dirt Euclidean distance (estimated from cropped local view)
+        # 最近污渍欧氏距离（基于裁剪后的局部视野粗估）
+        nearest_dirt_norm, dirt_delta = self._update_nearest_dirt_metrics()
 
         return np.array(
             [
@@ -228,30 +273,63 @@ class Preprocessor:
         """
         return list(self._legal_act)
 
-    def feature_process(self, env_obs, last_action):
-        """Generate 69D feature vector, legal action mask, and scalar reward.
+    def _build_reward_context(self, local_view, global_state, legal_action, legal_arr, feature):
+        """Build reward context from current preprocessor state.
 
-        生成 69D 特征向量、合法动作掩码和标量奖励。
+        基于当前预处理器状态构建 reward context。
+        """
+        context = RewardContext()
+        context.step_no = self.step_no
+        context.battery = self.battery
+        context.battery_max = self.battery_max
+        context.cur_pos = self.cur_pos
+        context.dirt_cleaned = self.dirt_cleaned
+        context.last_dirt_cleaned = self.last_dirt_cleaned
+        context.total_dirt = self.total_dirt
+
+        context.passable_map = np.array(self.passable_map, copy=True)
+        context.nearest_dirt_dist = self.nearest_dirt_dist
+        context.last_nearest_dirt_dist = self.last_nearest_dirt_dist
+
+        context._view_map = np.array(self._view_map, copy=True)
+        context._legal_act = list(self._legal_act)
+
+        context.local_view = np.array(local_view, copy=True)
+        context.global_state = np.array(global_state, copy=True)
+        context.legal_action = list(legal_action)
+        context.legal_arr = np.array(legal_arr, copy=True)
+        context.feature = np.array(feature, copy=True)
+
+        context.charge_distance = self.charge_distance
+        context.charge_dis_delta = self.charge_dis_delta
+        context.charge_dir = np.array(self.charge_dir, copy=True)
+        return context
+
+    def feature_process(self, env_obs, last_action):
+        """Generate 141D feature vector, legal action mask, and scalar reward.
+
+        生成 141D 特征向量、合法动作掩码和标量奖励。
         """
         self.pb2struct(env_obs, last_action)
 
-        local_view = self._get_local_view_feature()  # 49D
+        local_view = self._get_local_view_feature()  # 121D
         global_state = self._get_global_state_feature()  # 12D
         legal_action = self.get_legal_action()  # 8D
         legal_arr = np.array(legal_action, dtype=np.float32)
 
-        feature = np.concatenate([local_view, global_state, legal_arr])  # 69D
+        feature = np.concatenate([local_view, global_state, legal_arr])  # 141D
 
-        reward = self.reward_process()
+        reward_context = self._build_reward_context(local_view, global_state, legal_action, legal_arr, feature)
+        reward = self.reward_process(reward_context)
 
         return feature, legal_action, reward
 
-    def reward_process(self):
-        # Cleaning reward / 清扫奖励
-        cleaned_this_step = max(0, self.dirt_cleaned - self.last_dirt_cleaned)
-        cleaning_reward = 0.1 * cleaned_this_step
+    def reward_process(self, context):
+        """Compute reward with prepared reward context.
 
-        # Step penalty / 时间惩罚
-        step_penalty = -0.001
-
-        return cleaning_reward + step_penalty
+        基于构建好的 reward context 计算奖励。
+        """
+        total_reward = 0.0
+        total_reward += self.reward_charge.get_reward(context)
+        total_reward += self.reward_explore.get_reward(context)
+        return total_reward
