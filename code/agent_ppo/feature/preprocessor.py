@@ -10,11 +10,13 @@ Feature preprocessor for Robot Vacuum.
 清扫大作战特征预处理器。
 """
 
+import queue
 import numpy as np
 
 from agent_ppo.reward.reward_charge import RewardCharge
+from agent_ppo.reward.reward_clean import RewardClean
 from agent_ppo.reward.reward_context import RewardContext
-from agent_ppo.reward.reward_explore import RewardExplore
+from agent_ppo.reward.reward_explore import RewardCharge
 
 
 def _norm(v, v_max, v_min=0.0):
@@ -56,8 +58,8 @@ class Preprocessor:
         self.last_dirt_cleaned = 0
         self.total_dirt = 1
 
-        # Global passable map (0=obstacle, 1=passable), used for ray computation
-        # 维护全局通行地图（0=障碍, 1=可通行），用于射线计算
+        # Global passable map (0=obstacle, 1=passable, 3=charger), used for ray computation
+        # 维护全局通行地图（0=障碍, 1=可通行, 3=充电桩），用于射线计算
         self.passable_map = np.ones((self.GRID_SIZE, self.GRID_SIZE), dtype=np.int8)
 
         # Nearest dirt distance
@@ -72,10 +74,33 @@ class Preprocessor:
         # 最近的充电桩距离
         self.last_charge_distance = 200.0
         self.charge_distance = 200.0
-        self.charge_dis_delta = 0  #0 代表更近 1 代表更远   
+        self.charge_dis_delta = 0  # 1 代表更近，0 代表未更近
         self.charge_dir = np.zeros(8, dtype=np.float32)
+
+        self.charge_count = 0
+        self.total_charger = 0
+        self.charger_positions = []
+
+
+        # Reward components
+        # 奖励组件
         self.reward_charge = RewardCharge()
-        self.reward_explore = RewardExplore()
+        self.reward_clean = RewardClean()
+        self.reward_explore = RewardCharge()
+
+        # Reward metrics for monitoring
+        # 监控使用的分项奖励指标
+        self.last_charge_reward = 0.0
+        self.last_clean_reward = 0.0
+        self.last_explore_reward = 0.0
+        self.last_total_reward = 0.0
+        self.episode_charge_reward = 0.0
+        self.episode_clean_reward = 0.0
+        self.episode_explore_reward = 0.0
+        self.episode_total_reward = 0.0
+
+        # 里程碑奖励
+        self.first_charge_reward = False
 
 
     def pb2struct(self, env_obs, last_action):
@@ -87,6 +112,7 @@ class Preprocessor:
         frame_state = observation["frame_state"]
         env_info = observation["env_info"]
         hero = frame_state["heroes"]
+        organs = frame_state.get("organs") or []
 
         self.step_no = int(observation["step_no"])
         self.cur_pos = (int(hero["pos"]["x"]), int(hero["pos"]["z"]))
@@ -99,6 +125,7 @@ class Preprocessor:
         self.last_dirt_cleaned = self.dirt_cleaned
         self.dirt_cleaned = int(hero["dirt_cleaned"])
         self.total_dirt = max(int(env_info["total_dirt"]), 1)
+        self.total_charger = int(env_info.get("total_charger", self.total_charger))
 
         # Legal actions / 合法动作
         self._legal_act = [int(x) for x in (observation.get("legal_action") or [1] * 8)]
@@ -109,6 +136,33 @@ class Preprocessor:
             self._view_map = np.array(map_info, dtype=np.float32)
             hx, hz = self.cur_pos
             self._update_passable(hx, hz)
+
+        self._update_charger_state(organs)
+
+
+    def _update_charger_state(self, organs):
+        """Cache charger positions from observation organs.
+
+        从环境 observation 的 organs 字段中缓存充电桩位置。
+        """
+        charger_positions = []
+        for organ in organs:
+            if int(organ.get("sub_type", 0)) != 1:
+                continue
+
+            pos = organ.get("pos") or {}
+            x = int(pos.get("x", -1))
+            z = int(pos.get("z", -1))
+            if not (0 <= x < self.GRID_SIZE and 0 <= z < self.GRID_SIZE):
+                continue
+
+            charger_positions.append((x, z))
+
+        if charger_positions:
+            self.charger_positions = charger_positions
+            self.total_charger = max(self.total_charger, len(charger_positions))
+            for x, z in charger_positions:
+                self.passable_map[x, z] = 3
 
     def _get_nearest_dir(self):
         """Placeholder for nearest-direction helper.
@@ -131,8 +185,8 @@ class Preprocessor:
                 gx = hx - half + ri
                 gz = hz - half + ci
                 if 0 <= gx < self.GRID_SIZE and 0 <= gz < self.GRID_SIZE:
-                    # 0 = obstacle, 1/2 = passable
-                    # 0 = 障碍, 1/2 = 可通行
+                    # 0 = obstacle, 1 = passable, 3 = charger
+                    # 0 = 障碍, 1 = 可通行, 3 = 充电桩
                     self.passable_map[gx, gz] = 1 if view[ri, ci] != 0 else 0
 
     def _get_local_view_feature(self):
@@ -223,6 +277,30 @@ class Preprocessor:
         dirt_delta = 1.0 if self.nearest_dirt_dist < self.last_nearest_dirt_dist else 0.0
         return nearest_dirt_norm, dirt_delta
 
+
+    def _update_nearest_charge_metrics(self):
+        """Update nearest charge distance and approaching indicator.
+
+        更新最近充电桩距离及是否接近充电桩标记。
+        """
+        self.last_charge_distance = self.charge_distance
+        self.charge_distance = self._calc_nearest_charge_dist()
+        charge_delta = 1.0 if self.charge_distance < self.last_charge_distance else 0.0
+        self.charge_dis_delta = charge_delta
+
+    def _calc_nearest_charge_dist(self):
+        """Find nearest charger Euclidean distance from cached charger positions.
+
+        从已缓存的充电桩坐标中找最近充电桩的欧氏距离。
+        """
+        if not self.charger_positions:
+            return 200.0
+        cur = np.array(self.cur_pos, dtype=np.float32)
+        charger_coords = np.array(self.charger_positions, dtype=np.float32)
+        dists = np.sqrt(np.sum((charger_coords - cur) ** 2, axis=1))
+        return float(np.min(dists))
+        
+
     def _get_global_state_feature(self):
         """Global state feature (12D).
 
@@ -259,6 +337,19 @@ class Preprocessor:
         # 最近污渍欧氏距离（基于裁剪后的局部视野粗估）
         nearest_dirt_norm, dirt_delta = self._update_nearest_dirt_metrics()
 
+
+        # Nearest charge Euclidean distance (estimated from global map)
+        # 最近充电桩欧氏距离（基于全局地图粗估）
+        self._update_nearest_charge_metrics()
+
+
+        ## 计算充电指标
+        center_x = self._view_map.shape[0] // 2
+        center_z = self._view_map.shape[1] // 2
+        if self.passable_map[center_x, center_z] == 3:
+            self.charge_count += 1
+            self.first_charge_reward = True
+        
         return np.array(
             [
                 step_norm,
@@ -331,6 +422,8 @@ class Preprocessor:
         context.charge_distance = self.charge_distance
         context.charge_dis_delta = self.charge_dis_delta
         context.charge_dir = np.array(self.charge_dir, copy=True)
+        context.first_charge_reward = self.first_charge_reward
+        context.charge_count = self.charge_count
         return context
 
     def feature_process(self, env_obs, last_action):
@@ -363,7 +456,19 @@ class Preprocessor:
 
         基于构建好的 reward context 计算奖励。
         """
-        total_reward = 0.0
-        total_reward += self.reward_charge.get_reward(context)
-        total_reward += self.reward_explore.get_reward(context)
+        charge_reward = self.reward_charge.get_reward(context)
+        clean_reward = self.reward_clean.get_reward(context)
+        explore_reward = self.reward_explore.get_reward(context)
+        total_reward = charge_reward + clean_reward + explore_reward
+
+        self.last_charge_reward = float(charge_reward)
+        self.last_clean_reward = float(clean_reward)
+        self.last_explore_reward = float(explore_reward)
+        self.last_total_reward = float(total_reward)
+
+        self.episode_charge_reward += self.last_charge_reward
+        self.episode_clean_reward += self.last_clean_reward
+        self.episode_explore_reward += self.last_explore_reward
+        self.episode_total_reward += self.last_total_reward
+
         return total_reward

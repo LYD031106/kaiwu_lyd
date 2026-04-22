@@ -8,21 +8,25 @@ class RewardCharge:
     def get_reward(self, context: RewardContext):
         """Get reward from observation dict.
 
-        计算 充电奖励
+        计算 充电奖励 总量级为[-6, 6]
         """
         reward = 0.0
-        # 分阶段当电量在 50 以上 不会施加任何奖励
+        # 分阶段当电量在 30 以上 不会施加任何奖励
         if context.battery >= 30:
             pass
         elif context.battery < 30 and context.battery > 15:
-            if context.charge_dis_delta == 0:
-                reward += 0.5
+            if context.charge_dis_delta == 1:
+                reward += 0.1
             else:
-                reward -= 0.2
+                reward -= 0.1
         elif context.battery < 15:
-            if context.charge_dis_delta == 0:
-                reward += 0.7
+            if context.charge_dis_delta == 1:
+                reward += 0.15
             else:
-                reward -= 0.5
+                reward -= 0.15
+
+        # 里程碑奖励
+        if context.charge_count == 1 and context.first_charge_reward:
+            reward += 3
 
         return reward

@@ -28,13 +28,71 @@ def build_monitor():
             group_name_en="algorithm",
         )
         .add_panel(
-            name="累积回报",
-            name_en="reward",
+            name="训练回报",
+            name_en="training_reward",
             type="line",
         )
         .add_metric(
             metrics_name="reward",
             expr="avg(reward{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="单局累计奖励",
+            name_en="episode_reward_metrics",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="单局总奖励",
+            expr="avg(reward_total{})",
+        )
+        .add_metric(
+            metrics_name="清扫奖励",
+            expr="avg(reward_clean{})",
+        )
+        .add_metric(
+            metrics_name="探索奖励",
+            expr="avg(reward_explore{})",
+        )
+        .add_metric(
+            metrics_name="充电奖励",
+            expr="avg(reward_charge{})",
+        )
+        .add_metric(
+            metrics_name="终局奖励",
+            expr="avg(reward_final{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="单步平均奖励",
+            name_en="step_avg_reward_metrics",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="步均清扫奖励",
+            expr="avg(step_avg_reward_clean{})",
+        )
+        .add_metric(
+            metrics_name="步均探索奖励",
+            expr="avg(step_avg_reward_explore{})",
+        )
+        .add_metric(
+            metrics_name="步均充电奖励",
+            expr="avg(step_avg_reward_charge{})",
+        )
+        .end_panel()
+        .add_panel(
+            name="对局指标",
+            name_en="episode_metrics",
+            type="line",
+        )
+        .add_metric(
+            metrics_name="每局充电数",
+            expr="avg(charge_count{})",
+        )
+        .add_metric(
+            metrics_name="对局数",
+            expr="avg(episode_cnt{})",
         )
         .end_panel()
         .add_panel(

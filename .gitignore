@@ -31,3 +31,5 @@ SKILLS.md
 baseline_structure_analysis.md
 competition_summary.md
 .doc/
+dev/.docker-compose.yaml
+train/.docker-compose.yaml

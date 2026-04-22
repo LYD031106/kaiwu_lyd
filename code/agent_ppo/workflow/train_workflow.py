@@ -63,6 +63,8 @@ class EpisodeRunner:
         self.episode_cnt = 0
         self.last_report_monitor_time = 0
         self.last_get_training_metrics_time = 0
+        self.battery_off = 0.0
+        self.battery_off_ratio = 0.0
 
     def run_episodes(self):
         """Run a single episode and yield collected samples.
@@ -116,8 +118,12 @@ class EpisodeRunner:
                 terminated = env_obs["terminated"]
                 truncated = env_obs["truncated"]
                 frame_no = env_obs["frame_no"]
+                frame_state = env_obs["observation"]["frame_state"]
                 step += 1
                 done = terminated or truncated
+
+                # 获取当前电量状态
+                charge = frame_state["heroes"]["battery"]
 
                 # Process next observation
                 # 特征处理
@@ -142,15 +148,26 @@ class EpisodeRunner:
                         result_str = "WIN"
                     else:
                         # Early termination (battery depleted or collision): small penalty
-                        # 提前结束（电量耗尽或碰撞）：小惩罚
-                        final_reward = -2.0
+                        # 提前结束
+                        # 如果是电量耗尽 给大惩罚
+                        if charge <= 0:
+                            final_reward = -10.0
+                        # 如果是碰撞 给小惩罚
+                        else:
+                            final_reward = -2.0
+                        # 默认是由于电量耗尽导致提前结束
+                        self.battery_off += 1.0
+                        self.battery_off_ratio += 1.0 / self.episode_cnt
                         result_str = "FAIL"
-
                     self.logger.info(
                         f"[GAMEOVER] ep:{self.episode_cnt} steps:{step} "
                         f"result:{result_str} final_bonus:{final_reward:.2f} "
                         f"total_reward:{total_reward:.3f} "
+                        f"clean_reward:{fm.episode_clean_reward:.3f} "
+                        f"explore_reward:{fm.episode_explore_reward:.3f} "
+                        f"charge_reward:{fm.episode_charge_reward:.3f} "
                         f"dirt_cleaned:{fm.dirt_cleaned}/{fm.total_dirt}"
+                        f" battery_off_ratio:{self.battery_off_ratio:.4f} charge_count:{fm.charge_count}"
                     )
 
                 # Build sample frame
@@ -180,10 +197,20 @@ class EpisodeRunner:
                     # Monitor reporting / 监控上报
                     now = time.time()
                     if now - self.last_report_monitor_time >= 60 and self.monitor:
+                        fm = self.agent.preprocessor
+                        step_count = max(step, 1)
                         self.monitor.put_data(
                             {
                                 os.getpid(): {
-                                    "reward": total_reward + final_reward,
+                                    "reward_total": fm.episode_total_reward + final_reward,
+                                    "reward_clean": fm.episode_clean_reward,
+                                    "reward_explore": fm.episode_explore_reward,
+                                    "reward_charge": fm.episode_charge_reward,
+                                    "reward_final": final_reward,
+                                    "step_avg_reward_clean": fm.episode_clean_reward / step_count,
+                                    "step_avg_reward_explore": fm.episode_explore_reward / step_count,
+                                    "step_avg_reward_charge": fm.episode_charge_reward / step_count,
+                                    "charge_count": fm.charge_count,
                                     "episode_cnt": self.episode_cnt,
                                 }
                             }

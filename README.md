@@ -15,6 +15,7 @@
 - `code/`：策略代码、特征处理、训练逻辑、算法配置
 - `train/`：训练环境的 Docker Compose 配置
 - `dev/`：开发环境的 Docker Compose 配置
+- `.doc/`：实验说明、奖励分析、训练诊断与协议文档
 
 核心训练代码入口：
 
@@ -63,3 +64,12 @@
 - `max_step = 1000`
 - `battery_max = 200`
 
+## 环境协议文档
+
+如果你想先看清楚环境接口返回了什么、动作怎么编码、状态值和视野网格值分别代表什么，可以直接阅读：
+
+- `.doc/robot_vacuum_env_protocol.md`
+
+如果你想进一步理解当前仓库中观测、动作、奖励和训练流程是如何落地到 PPO 代码中的，可以继续阅读：
+
+- `.doc/robot_vacuum_current_experiment_readable_doc.md`
