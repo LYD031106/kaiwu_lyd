@@ -53,3 +53,6 @@ class RewardContext:
         # 里程碑奖励
         self.first_charge_reward = False
         self.charge_count = 0
+
+        # 循环位置
+        self.loop_pos = 0.0

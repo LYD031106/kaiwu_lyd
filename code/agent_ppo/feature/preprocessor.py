@@ -102,6 +102,10 @@ class Preprocessor:
         # 里程碑奖励
         self.first_charge_reward = False
 
+        # 维护最近3个时间段内的位置
+        self.last_pos_queue = queue.Queue(maxsize=3)
+        self.loop_pos = 0.0
+
 
     def pb2struct(self, env_obs, last_action):
         """Parse and cache essential fields from observation dict.
@@ -127,6 +131,9 @@ class Preprocessor:
         self.total_dirt = max(int(env_info["total_dirt"]), 1)
         self.total_charger = int(env_info.get("total_charger", self.total_charger))
 
+        # Update loop position
+        self._update_loop_pos(self.cur_pos)
+
         # Legal actions / 合法动作
         self._legal_act = [int(x) for x in (observation.get("legal_action") or [1] * 8)]
 
@@ -138,6 +145,24 @@ class Preprocessor:
             self._update_passable(hx, hz)
 
         self._update_charger_state(organs)
+
+    def _update_loop_pos(self, cur_pos):
+        """Update loop position.
+
+        更新循环位置。
+        """
+        # 首先计算当前位置出现了多少次
+        pos_count = 0
+        for _ in range(self.last_pos_queue.qsize()):
+            if self.last_pos_queue.get() == cur_pos:
+                pos_count += 1
+        self.loop_pos = pos_count
+        if self.last_pos_queue.qsize() < 3:
+            self.last_pos_queue.put(cur_pos)
+        else:
+            # 如果队列已满，移除旧位置
+            self.last_pos_queue.get()
+            self.last_pos_queue.put(cur_pos)
 
 
     def _update_charger_state(self, organs):
@@ -424,6 +449,8 @@ class Preprocessor:
         context.charge_dir = np.array(self.charge_dir, copy=True)
         context.first_charge_reward = self.first_charge_reward
         context.charge_count = self.charge_count
+        context.loop_pos = self.loop_pos
+
         return context
 
     def feature_process(self, env_obs, last_action):

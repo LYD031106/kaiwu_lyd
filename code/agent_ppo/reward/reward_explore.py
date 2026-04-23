@@ -14,6 +14,8 @@ class RewardCharge:
         
         # 首先计算打扫奖励
         if context.dirt_cleaned - context.last_dirt_cleaned > 0:
-            reward += (context.dirt_cleaned - context.last_dirt_cleaned) * 0.1
+            reward += (context.dirt_cleaned - context.last_dirt_cleaned) * 0.005
         
+        if context.loop_pos > 0:
+            reward += context.loop_pos * 0.005
         return reward

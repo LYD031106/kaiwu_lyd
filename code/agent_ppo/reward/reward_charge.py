@@ -11,19 +11,21 @@ class RewardCharge:
         计算 充电奖励 总量级为[-6, 6]
         """
         reward = 0.0
-        # 分阶段当电量在 30 以上 不会施加任何奖励
+        # 分阶段当电量在 30 以上 不会施加任何奖励 适当进行惩罚
+        charge_ratio = context.battery / context.battery_max
         if context.battery >= 30:
-            pass
+            # 适当进行惩罚
+            reward -= charge_ratio * 0.2
         elif context.battery < 30 and context.battery > 15:
             if context.charge_dis_delta == 1:
-                reward += 0.1
+                reward += 0.2
             else:
-                reward -= 0.1
+                reward -= 0.2
         elif context.battery < 15:
             if context.charge_dis_delta == 1:
-                reward += 0.15
+                reward += 0.4
             else:
-                reward -= 0.15
+                reward -= 0.4
 
         # 里程碑奖励
         if context.charge_count == 1 and context.first_charge_reward:
