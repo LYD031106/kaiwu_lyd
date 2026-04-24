@@ -11,4 +11,4 @@ class RewardClean:
         仅计算清扫增量奖励。
         """
         cleaned_delta = max(int(context.dirt_cleaned) - int(context.last_dirt_cleaned), 0)
-        return cleaned_delta * 0.05
+        return cleaned_delta * 0.1

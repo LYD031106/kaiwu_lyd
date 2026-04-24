@@ -49,10 +49,14 @@ class RewardContext:
         self.charge_distance = 200.0
         self.charge_dis_delta = 0
         self.charge_dir = np.zeros(8, dtype=np.float32)
+        self.charging = False  # 是否正在充电中
 
         # 里程碑奖励
         self.first_charge_reward = False
         self.charge_count = 0
 
-        # 循环位置
+        # 循环次数
         self.loop_pos = 0.0
+
+        # npc 靠近状态
+        self.close_npc_state = False

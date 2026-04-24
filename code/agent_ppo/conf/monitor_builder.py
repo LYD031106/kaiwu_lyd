@@ -55,6 +55,10 @@ def build_monitor():
             expr="avg(reward_explore{})",
         )
         .add_metric(
+            metrics_name="NPC奖励",
+            expr="avg(reward_npc{})",
+        )
+        .add_metric(
             metrics_name="充电奖励",
             expr="avg(reward_charge{})",
         )
@@ -75,6 +79,10 @@ def build_monitor():
         .add_metric(
             metrics_name="步均探索奖励",
             expr="avg(step_avg_reward_explore{})",
+        )
+        .add_metric(
+            metrics_name="步均NPC奖励",
+            expr="avg(step_avg_reward_npc{})",
         )
         .add_metric(
             metrics_name="步均充电奖励",

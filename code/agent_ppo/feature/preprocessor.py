@@ -10,13 +10,14 @@ Feature preprocessor for Robot Vacuum.
 清扫大作战特征预处理器。
 """
 
-import queue
+from collections import deque
 import numpy as np
 
 from agent_ppo.reward.reward_charge import RewardCharge
 from agent_ppo.reward.reward_clean import RewardClean
 from agent_ppo.reward.reward_context import RewardContext
-from agent_ppo.reward.reward_explore import RewardCharge
+from agent_ppo.reward.reward_explore import RewardExplore
+from agent_ppo.reward.reward_npc import RewardNpc
 
 
 def _norm(v, v_max, v_min=0.0):
@@ -74,37 +75,48 @@ class Preprocessor:
         # 最近的充电桩距离
         self.last_charge_distance = 200.0
         self.charge_distance = 200.0
-        self.charge_dis_delta = 0  # 1 代表更近，0 代表未更近
+        self.charge_dis_delta = 0.0  # >0 代表更近，<0 代表更远，0 代表不变
         self.charge_dir = np.zeros(8, dtype=np.float32)
 
         self.charge_count = 0
         self.total_charger = 0
         self.charger_positions = []
 
+        self.charging = False  # 是否正在充电中
+        self.last_charging = False  # 上一个时间步是否正在充电
+
 
         # Reward components
         # 奖励组件
         self.reward_charge = RewardCharge()
         self.reward_clean = RewardClean()
-        self.reward_explore = RewardCharge()
+        self.reward_explore = RewardExplore()
+        self.reward_npc = RewardNpc()
 
         # Reward metrics for monitoring
         # 监控使用的分项奖励指标
         self.last_charge_reward = 0.0
         self.last_clean_reward = 0.0
         self.last_explore_reward = 0.0
+        self.last_npc_reward = 0.0
         self.last_total_reward = 0.0
         self.episode_charge_reward = 0.0
         self.episode_clean_reward = 0.0
         self.episode_explore_reward = 0.0
+        self.episode_npc_reward = 0.0
         self.episode_total_reward = 0.0
 
         # 里程碑奖励
         self.first_charge_reward = False
 
         # 维护最近3个时间段内的位置
-        self.last_pos_queue = queue.Queue(maxsize=3)
+        self.last_pos_queue = deque(maxlen=3)
         self.loop_pos = 0.0
+
+        # npc 位置
+        self.npc_positions = []
+        self.last_npc_distance = 200.0  # 上一个时间步的 npc 距离
+        self.close_npc_state = False  # 是否距离 npc 过近了
 
 
     def pb2struct(self, env_obs, last_action):
@@ -117,6 +129,9 @@ class Preprocessor:
         env_info = observation["env_info"]
         hero = frame_state["heroes"]
         organs = frame_state.get("organs") or []
+
+        # 单步事件标记：每一帧开始时先清零，只有本步满足条件时再置为 True
+        self.first_charge_reward = False
 
         self.step_no = int(observation["step_no"])
         self.cur_pos = (int(hero["pos"]["x"]), int(hero["pos"]["z"]))
@@ -145,24 +160,16 @@ class Preprocessor:
             self._update_passable(hx, hz)
 
         self._update_charger_state(organs)
+        self._update_npc_state(self.cur_pos, frame_state.get("npcs") or [])
 
     def _update_loop_pos(self, cur_pos):
         """Update loop position.
 
         更新循环位置。
         """
-        # 首先计算当前位置出现了多少次
-        pos_count = 0
-        for _ in range(self.last_pos_queue.qsize()):
-            if self.last_pos_queue.get() == cur_pos:
-                pos_count += 1
-        self.loop_pos = pos_count
-        if self.last_pos_queue.qsize() < 3:
-            self.last_pos_queue.put(cur_pos)
-        else:
-            # 如果队列已满，移除旧位置
-            self.last_pos_queue.get()
-            self.last_pos_queue.put(cur_pos)
+        # 计算当前位置在最近历史窗口中重复出现的次数
+        self.loop_pos = float(sum(1 for pos in self.last_pos_queue if pos == cur_pos))
+        self.last_pos_queue.append(cur_pos)
 
 
     def _update_charger_state(self, organs):
@@ -188,6 +195,41 @@ class Preprocessor:
             self.total_charger = max(self.total_charger, len(charger_positions))
             for x, z in charger_positions:
                 self.passable_map[x, z] = 3
+
+        self.last_charging = self.charging
+        self.charging = self.cur_pos in self.charger_positions
+
+    
+    def _update_npc_state(self, cur_pos, npcs):
+        """Cache npc positions from observation npcs.
+
+        从环境 observation 的 npcs 字段中缓存 npc 位置。
+        """
+        npc_positions = []
+        for npc in npcs:
+            if not isinstance(npc, dict):
+                continue
+
+            pos = npc.get("pos") or {}
+            x = int(pos.get("x", -1))
+            z = int(pos.get("z", -1))
+            if not (0 <= x < self.GRID_SIZE and 0 <= z < self.GRID_SIZE):
+                continue
+
+            npc_positions.append((x, z))
+        self.npc_positions = npc_positions
+
+        # 计算距离最近的 npc 距离
+        if npc_positions:
+            npc_distance = float(np.min([
+                np.sqrt((x - cur_pos[0])**2 + (z - cur_pos[1])**2) for x, z in npc_positions
+            ]))
+        else:
+            npc_distance = 200.0
+        # 只有当距离npc为2个格子的时候，才认为是距离npc过近了 给reward用
+        self.close_npc_state = npc_distance < 5.0 and npc_distance < self.last_npc_distance
+        self.last_npc_distance = npc_distance
+
 
     def _get_nearest_dir(self):
         """Placeholder for nearest-direction helper.
@@ -310,8 +352,7 @@ class Preprocessor:
         """
         self.last_charge_distance = self.charge_distance
         self.charge_distance = self._calc_nearest_charge_dist()
-        charge_delta = 1.0 if self.charge_distance < self.last_charge_distance else 0.0
-        self.charge_dis_delta = charge_delta
+        self.charge_dis_delta = float(self.last_charge_distance - self.charge_distance)
 
     def _calc_nearest_charge_dist(self):
         """Find nearest charger Euclidean distance from cached charger positions.
@@ -369,9 +410,7 @@ class Preprocessor:
 
 
         ## 计算充电指标
-        center_x = self._view_map.shape[0] // 2
-        center_z = self._view_map.shape[1] // 2
-        if self.passable_map[center_x, center_z] == 3:
+        if self.charging and not self.last_charging:
             self.charge_count += 1
             self.first_charge_reward = True
         
@@ -447,9 +486,11 @@ class Preprocessor:
         context.charge_distance = self.charge_distance
         context.charge_dis_delta = self.charge_dis_delta
         context.charge_dir = np.array(self.charge_dir, copy=True)
+        context.charging = self.charging
         context.first_charge_reward = self.first_charge_reward
         context.charge_count = self.charge_count
         context.loop_pos = self.loop_pos
+        context.close_npc_state = self.close_npc_state
 
         return context
 
@@ -486,16 +527,20 @@ class Preprocessor:
         charge_reward = self.reward_charge.get_reward(context)
         clean_reward = self.reward_clean.get_reward(context)
         explore_reward = self.reward_explore.get_reward(context)
-        total_reward = charge_reward + clean_reward + explore_reward
+        npc_reward = self.reward_npc.get_reward(context)
+        
+        total_reward = charge_reward + clean_reward + explore_reward + npc_reward
 
         self.last_charge_reward = float(charge_reward)
         self.last_clean_reward = float(clean_reward)
         self.last_explore_reward = float(explore_reward)
+        self.last_npc_reward = float(npc_reward)
         self.last_total_reward = float(total_reward)
 
         self.episode_charge_reward += self.last_charge_reward
         self.episode_clean_reward += self.last_clean_reward
         self.episode_explore_reward += self.last_explore_reward
+        self.episode_npc_reward += self.last_npc_reward
         self.episode_total_reward += self.last_total_reward
 
         return total_reward

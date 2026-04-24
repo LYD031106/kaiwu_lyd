@@ -1,7 +1,7 @@
 from agent_ppo.reward.reward_context import RewardContext
 
 
-class RewardCharge:
+class RewardExplore:
     def __init__(self):
         self.reward_context = RewardContext()
     
@@ -12,10 +12,11 @@ class RewardCharge:
         """
         reward = 0.0
         
-        # 首先计算打扫奖励
+        # 首先计算探索奖励
+        # 直接污渍来，因为污渍肯定就是没去过的地方
         if context.dirt_cleaned - context.last_dirt_cleaned > 0:
-            reward += (context.dirt_cleaned - context.last_dirt_cleaned) * 0.005
+            reward += (context.dirt_cleaned - context.last_dirt_cleaned) * 0.01
         
         if context.loop_pos > 0:
-            reward += context.loop_pos * 0.005
+            reward -= context.loop_pos * 0.01
         return reward

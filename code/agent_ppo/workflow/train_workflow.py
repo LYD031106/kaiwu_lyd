@@ -152,12 +152,12 @@ class EpisodeRunner:
                         # 如果是电量耗尽 给大惩罚
                         if charge <= 0:
                             final_reward = -10.0
-                        # 如果是碰撞 给小惩罚
+                        # 如果是碰撞 给中惩罚
                         else:
-                            final_reward = -2.0
+                            final_reward = -7.0
                         # 默认是由于电量耗尽导致提前结束
                         self.battery_off += 1.0
-                        self.battery_off_ratio += 1.0 / self.episode_cnt
+                        self.battery_off_ratio += self.battery_off / self.episode_cnt
                         result_str = "FAIL"
                     self.logger.info(
                         f"[GAMEOVER] ep:{self.episode_cnt} steps:{step} "
@@ -205,10 +205,12 @@ class EpisodeRunner:
                                     "reward_total": fm.episode_total_reward + final_reward,
                                     "reward_clean": fm.episode_clean_reward,
                                     "reward_explore": fm.episode_explore_reward,
+                                    "reward_npc": fm.episode_npc_reward,
                                     "reward_charge": fm.episode_charge_reward,
                                     "reward_final": final_reward,
                                     "step_avg_reward_clean": fm.episode_clean_reward / step_count,
                                     "step_avg_reward_explore": fm.episode_explore_reward / step_count,
+                                    "step_avg_reward_npc": fm.episode_npc_reward / step_count,
                                     "step_avg_reward_charge": fm.episode_charge_reward / step_count,
                                     "charge_count": fm.charge_count,
                                     "episode_cnt": self.episode_cnt,
