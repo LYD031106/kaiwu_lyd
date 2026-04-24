@@ -18,5 +18,5 @@ class RewardExplore:
             reward += (context.dirt_cleaned - context.last_dirt_cleaned) * 0.01
         
         if context.loop_pos > 0:
-            reward -= context.loop_pos * 0.01
+            reward -= context.loop_pos * 0.1
         return reward
