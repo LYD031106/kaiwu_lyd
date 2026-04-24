@@ -4,7 +4,7 @@ import numpy as np
 class RewardContext:
     GRID_SIZE = 128
     VIEW_HALF = 10
-    LOCAL_HALF = 5
+    LOCAL_HALF = 7
 
     def __init__(self):
         self.reset()
@@ -33,11 +33,11 @@ class RewardContext:
         self._legal_act = [1] * 8
 
         # 特征处理结果缓存
-        self.local_view = np.zeros(121, dtype=np.float32)
-        self.global_state = np.zeros(12, dtype=np.float32)
+        self.local_view = np.zeros(225, dtype=np.float32)
+        self.global_state = np.zeros(36, dtype=np.float32)
         self.legal_action = [1] * 8
         self.legal_arr = np.ones(8, dtype=np.float32)
-        self.feature = np.zeros(141, dtype=np.float32)
+        self.feature = np.zeros(269, dtype=np.float32)
         self.reward = 0.0
 
         # 探索字段

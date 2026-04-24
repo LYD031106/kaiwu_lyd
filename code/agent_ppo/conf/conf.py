@@ -13,11 +13,11 @@ Configuration for Robot Vacuum PPO agent.
 
 class Config:
 
-    # Feature dimensions (141D)
-    # 特征维度（141D）
+    # Feature dimensions (269D)
+    # 特征维度（269D）
     FEATURES = [
-        11 * 11,
-        12,
+        15 * 15,
+        36,
         8,
     ]
     FEATURE_SPLIT_SHAPE = FEATURES

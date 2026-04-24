@@ -20,14 +20,14 @@ class RewardCharge:
                 reward -= 0.2
         elif context.battery < 30 and context.battery > 15:
             if moving_towards_charge:
-                reward += 0.1
-            else :
-                reward -= 0.1
-        elif context.battery < 15:
-            if moving_towards_charge:
                 reward += 0.2
             else :
                 reward -= 0.2
+        elif context.battery < 15:
+            if moving_towards_charge:
+                reward += 0.4
+            else :
+                reward -= 0.4
 
 
         # 里程碑奖励

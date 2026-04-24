@@ -39,7 +39,18 @@ class Preprocessor:
 
     GRID_SIZE = 128
     VIEW_HALF = 21  # Full local view radius (21×21) / 完整局部视野半径
-    LOCAL_HALF = 5  # Cropped view radius (11×11) / 裁剪后的视野半径
+    LOCAL_HALF = 7  # Cropped view radius (15×15) / 裁剪后的视野半径
+    TARGET_MAX_DIST = 180.0
+    RAY_DIRS_8 = [
+        (0, -1),
+        (1, -1),
+        (1, 0),
+        (1, 1),
+        (0, 1),
+        (-1, 1),
+        (-1, 0),
+        (-1, -1),
+    ]
 
     def __init__(self):
         self.reset()
@@ -67,6 +78,8 @@ class Preprocessor:
         # 最近污渍距离
         self.nearest_dirt_dist = 200.0
         self.last_nearest_dirt_dist = 200.0
+        self.nearest_charge_dist = 200.0
+        self.last_nearest_charge_dist = 200.0
 
         self._view_map = np.zeros((21, 21), dtype=np.float32)
         self._legal_act = [1] * 8
@@ -257,9 +270,9 @@ class Preprocessor:
                     self.passable_map[gx, gz] = 1 if view[ri, ci] != 0 else 0
 
     def _get_local_view_feature(self):
-        """Local view feature (121D): crop center 11×11 from 21×21.
+        """Local view feature: crop center 15×15 from 21×21.
 
-        局部视野特征（121D）：从 21×21 视野中心裁剪 11×11。
+        局部视野特征：从 21×21 视野中心裁剪 15×15。
         """
         view = np.asarray(self._view_map, dtype=np.float32)
         if view.ndim != 2:
@@ -305,20 +318,14 @@ class Preprocessor:
 
         return int(self._view_map[view_x, view_z])
 
-    def _calc_ray_dirt_features(self, hx, hz, max_ray=30):
-        """Find normalized nearest dirt distance along 8 rays.
+    def _calc_ray_target_features(self, target_value, hx, hz, max_ray=30):
+        """Find normalized nearest target distance along 8 rays.
 
-        计算八方向射线上最近污渍距离，并归一化。
+        计算八方向射线上最近目标距离，并归一化。
         """
-        ray_dirs = [
-            (0, -1),
-            (1, 0),
-            (0, 1),
-            (-1, 0),
-        ]  # N E S W
-        ray_dirt = []
+        ray_target = []
 
-        for dx, dz in ray_dirs:
+        for dx, dz in self.RAY_DIRS_8:
             x, z = hx, hz
             found = max_ray
             for step in range(1, max_ray + 1):
@@ -326,12 +333,30 @@ class Preprocessor:
                 z += dz
                 if not (0 <= x < self.GRID_SIZE and 0 <= z < self.GRID_SIZE):
                     break
-                if self._get_view_cell(x, z, hx, hz) == 2:
+                if self._get_view_cell(x, z, hx, hz) == target_value:
                     found = step
                     break
-            ray_dirt.append(_norm(found, max_ray))
+            ray_target.append(_norm(found, max_ray))
 
-        return ray_dirt
+        return ray_target
+
+    def _calc_ray_dirt_features(self, hx, hz, max_ray=30):
+        return self._calc_ray_target_features(2, hx, hz, max_ray=max_ray)
+
+    def _calc_ray_charge_features(self, hx, hz, max_ray=60):
+        ray_charge = []
+        for dx, dz in self.RAY_DIRS_8:
+            found = max_ray
+            for step in range(1, max_ray + 1):
+                x = hx + dx * step
+                z = hz + dz * step
+                if not (0 <= x < self.GRID_SIZE and 0 <= z < self.GRID_SIZE):
+                    break
+                if self.passable_map[x, z] == 3:
+                    found = step
+                    break
+            ray_charge.append(_norm(found, max_ray))
+        return ray_charge
 
     def _update_nearest_dirt_metrics(self):
         """Update nearest dirt distance and approaching indicator.
@@ -340,7 +365,7 @@ class Preprocessor:
         """
         self.last_nearest_dirt_dist = self.nearest_dirt_dist
         self.nearest_dirt_dist = self._calc_nearest_dirt_dist()
-        nearest_dirt_norm = _norm(self.nearest_dirt_dist, 180)
+        nearest_dirt_norm = _norm(self.nearest_dirt_dist, self.TARGET_MAX_DIST)
         dirt_delta = 1.0 if self.nearest_dirt_dist < self.last_nearest_dirt_dist else 0.0
         return nearest_dirt_norm, dirt_delta
 
@@ -351,8 +376,45 @@ class Preprocessor:
         更新最近充电桩距离及是否接近充电桩标记。
         """
         self.last_charge_distance = self.charge_distance
+        self.last_nearest_charge_dist = self.nearest_charge_dist
         self.charge_distance = self._calc_nearest_charge_dist()
+        self.nearest_charge_dist = self.charge_distance
         self.charge_dis_delta = float(self.last_charge_distance - self.charge_distance)
+
+    def _calc_target_direction_feature(self, target_positions):
+        """Build soft 8-direction feature for nearest target.
+
+        为最近目标构建 8 方向 soft one-hot 特征。
+        """
+        direction = np.zeros(8, dtype=np.float32)
+        if not target_positions:
+            return direction
+
+        cur = np.array(self.cur_pos, dtype=np.float32)
+        target = min(target_positions, key=lambda pos: (pos[0] - self.cur_pos[0]) ** 2 + (pos[1] - self.cur_pos[1]) ** 2)
+        vec = np.array([target[0] - cur[0], target[1] - cur[1]], dtype=np.float32)
+        norm = np.linalg.norm(vec)
+        if norm <= 1e-6:
+            direction.fill(1.0 / 8.0)
+            return direction
+
+        unit = vec / norm
+        basis = [
+            np.array([0.0, -1.0], dtype=np.float32),
+            np.array([1.0, -1.0], dtype=np.float32) / np.sqrt(2.0),
+            np.array([1.0, 0.0], dtype=np.float32),
+            np.array([1.0, 1.0], dtype=np.float32) / np.sqrt(2.0),
+            np.array([0.0, 1.0], dtype=np.float32),
+            np.array([-1.0, 1.0], dtype=np.float32) / np.sqrt(2.0),
+            np.array([-1.0, 0.0], dtype=np.float32),
+            np.array([-1.0, -1.0], dtype=np.float32) / np.sqrt(2.0),
+        ]
+        scores = np.maximum(np.array([float(np.dot(unit, b)) for b in basis], dtype=np.float32), 0.0)
+        score_sum = float(np.sum(scores))
+        if score_sum <= 1e-6:
+            direction.fill(1.0 / 8.0)
+            return direction
+        return scores / score_sum
 
     def _calc_nearest_charge_dist(self):
         """Find nearest charger Euclidean distance from cached charger positions.
@@ -368,9 +430,9 @@ class Preprocessor:
         
 
     def _get_global_state_feature(self):
-        """Global state feature (12D).
+        """Global state feature (36D).
 
-        全局状态特征（12D）。
+        全局状态特征（36D）。
 
         Dimensions / 维度说明：
           [0]  step_norm         step progress / 步数归一化 [0,1]
@@ -379,12 +441,15 @@ class Preprocessor:
           [3]  remaining_dirt    remaining dirt ratio / 剩余污渍比例 [0,1]
           [4]  pos_x_norm        x position / x 坐标归一化 [0,1]
           [5]  pos_z_norm        z position / z 坐标归一化 [0,1]
-          [6]  ray_N_dirt        north ray distance / 向上（z-）方向最近污渍距离
-          [7]  ray_E_dirt        east ray distance / 向右（x+）方向
-          [8]  ray_S_dirt        south ray distance / 向下（z+）方向
-          [9]  ray_W_dirt        west ray distance / 向左（x-）方向
-          [10] nearest_dirt_norm nearest dirt Euclidean distance / 最近污渍欧氏距离归一化
-          [11] dirt_delta        approaching dirt indicator / 是否在接近污渍（1=是, 0=否）
+          [6]  charging_flag     on charger / 是否正在充电桩上
+          [7]  charge_count_norm charge count / 充电次数归一化
+          [8:16]   ray_dirt_8      8方向污渍距离
+          [16]     nearest_dirt    最近污渍距离归一化
+          [17]     dirt_delta      是否接近污渍
+          [18:26]  ray_charge_8    8方向充电桩距离
+          [26:34]  charge_dir_8    最近充电桩相对方向
+          [34]     nearest_charge  最近充电桩距离归一化
+          [35]     charge_delta    是否接近充电桩
         """
         step_norm = _norm(self.step_no, 2000)
         battery_ratio = _norm(self.battery, self.battery_max)
@@ -395,8 +460,10 @@ class Preprocessor:
         pos_x_norm = _norm(hx, self.GRID_SIZE)
         pos_z_norm = _norm(hz, self.GRID_SIZE)
 
-        # 4-directional ray to find nearest dirt
-        # 四方向射线找最近污渍距离 
+        charging_flag = 1.0 if self.charging else 0.0
+        charge_count_norm = _norm(self.charge_count, max(self.total_charger, 1) * 4)
+
+        # 8-directional rays for dirt / 污渍八方向射线距离
         ray_dirt = self._calc_ray_dirt_features(hx, hz)
 
         # Nearest dirt Euclidean distance (estimated from cropped local view)
@@ -407,6 +474,10 @@ class Preprocessor:
         # Nearest charge Euclidean distance (estimated from global map)
         # 最近充电桩欧氏距离（基于全局地图粗估）
         self._update_nearest_charge_metrics()
+        nearest_charge_norm = _norm(self.charge_distance, self.TARGET_MAX_DIST)
+        charge_delta = 1.0 if self.charge_dis_delta > 0 else 0.0
+        ray_charge = self._calc_ray_charge_features(hx, hz)
+        self.charge_dir = self._calc_target_direction_feature(self.charger_positions)
 
 
         ## 计算充电指标
@@ -422,12 +493,15 @@ class Preprocessor:
                 remaining_dirt,
                 pos_x_norm,
                 pos_z_norm,
-                ray_dirt[0],
-                ray_dirt[1],
-                ray_dirt[2],
-                ray_dirt[3],
+                charging_flag,
+                charge_count_norm,
+                *ray_dirt,
                 nearest_dirt_norm,
                 dirt_delta,
+                *ray_charge,
+                *self.charge_dir.tolist(),
+                nearest_charge_norm,
+                charge_delta,
             ],
             dtype=np.float32,
         )
@@ -472,7 +546,7 @@ class Preprocessor:
         context.passable_map = np.array(self.passable_map, copy=True)
         context.nearest_dirt_dist = self.nearest_dirt_dist
         context.last_nearest_dirt_dist = self.last_nearest_dirt_dist
-        context.dirt_delta = float(global_state[11])
+        context.dirt_delta = float(global_state[17])
 
         context._view_map = np.array(self._view_map, copy=True)
         context._legal_act = list(self._legal_act)
@@ -495,19 +569,20 @@ class Preprocessor:
         return context
 
     def feature_process(self, env_obs, last_action):
-        """Generate 141D feature vector, legal action mask, and scalar reward.
+        """Generate feature vector, legal action mask, and scalar reward.
 
-        生成 141D 特征向量、合法动作掩码和标量奖励。
+        生成特征向量、合法动作掩码和标量奖励。
         """
         self.pb2struct(env_obs, last_action)
 
-        local_view = self._get_local_view_feature()  # 121D
-        global_state = self._get_global_state_feature()  # 12D
+        local_view = self._get_local_view_feature()  # 225D
+        global_state = self._get_global_state_feature()  # 36D
         legal_action = self.get_legal_action()  # 8D
         legal_arr = np.array(legal_action, dtype=np.float32)
 
-        feature = np.concatenate([local_view, global_state, legal_arr])  # 141D
-        if feature.shape[0] != 141:
+        feature = np.concatenate([local_view, global_state, legal_arr])
+        expected_dim = local_view.shape[0] + global_state.shape[0] + legal_arr.shape[0]
+        if feature.shape[0] != expected_dim:
             raise ValueError(
                 f"feature_process produced invalid dim={feature.shape[0]}, "
                 f"local_view_shape={self._view_map.shape if self._view_map is not None else None}, "

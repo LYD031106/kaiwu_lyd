@@ -38,7 +38,7 @@ class Model(nn.Module):
         self.model_name = "robot_vacuum"
         self.device = device
 
-        obs_dim = Config.DIM_OF_OBSERVATION  # 141
+        obs_dim = Config.DIM_OF_OBSERVATION  # 269
         act_num = Config.ACTION_NUM  # 8
         local_dim, global_dim, legal_dim = Config.FEATURE_SPLIT_SHAPE
         self.local_map_hw = int(local_dim**0.5)
@@ -46,7 +46,7 @@ class Model(nn.Module):
         self.global_dim = global_dim
         self.legal_dim = legal_dim
 
-        # Local map encoder / 局部地图编码器（11x11 -> feature）
+        # Local map encoder / 局部地图编码器（15x15 -> feature）
         self.local_encoder = nn.Sequential(
             nn.Conv2d(1, 16, kernel_size=3, padding=1),
             nn.ReLU(),
