@@ -38,6 +38,11 @@ class Preprocessor:
     """
 
     GRID_SIZE = 128
+    MAP_UNKNOWN = -1
+    MAP_OBSTACLE = 0
+    MAP_ROAD = 1
+    MAP_DIRT = 2
+    MAP_CHARGER = 3
     VIEW_HALF = 21  # Full local view radius (21×21) / 完整局部视野半径
     LOCAL_HALF = 7  # Cropped view radius (15×15) / 裁剪后的视野半径
     TARGET_MAX_DIST = 180.0
@@ -50,6 +55,16 @@ class Preprocessor:
         (-1, 1),
         (-1, 0),
         (-1, -1),
+    ]
+    ACTION_DIRS_8 = [
+        (1, 0),
+        (1, -1),
+        (0, -1),
+        (-1, -1),
+        (-1, 0),
+        (-1, 1),
+        (0, 1),
+        (1, 1),
     ]
 
     def __init__(self):
@@ -70,9 +85,10 @@ class Preprocessor:
         self.last_dirt_cleaned = 0
         self.total_dirt = 1
 
-        # Global passable map (0=obstacle, 1=passable, 3=charger), used for ray computation
-        # 维护全局通行地图（0=障碍, 1=可通行, 3=充电桩），用于射线计算
-        self.passable_map = np.ones((self.GRID_SIZE, self.GRID_SIZE), dtype=np.int8)
+        # Global map memory (-1=unknown, 0=obstacle, 1=road, 2=dirt, 3=charger)
+        # 全局地图记忆（-1=未知, 0=障碍, 1=道路, 2=污渍, 3=充电桩）
+        self.passable_map = np.full((self.GRID_SIZE, self.GRID_SIZE), self.MAP_UNKNOWN, dtype=np.int8)
+        self.visit = np.zeros((self.GRID_SIZE, self.GRID_SIZE), dtype=np.int8)
 
         # Nearest dirt distance
         # 最近污渍距离
@@ -82,6 +98,7 @@ class Preprocessor:
         self.last_nearest_charge_dist = 200.0
 
         self._view_map = np.zeros((21, 21), dtype=np.float32)
+        self._raw_legal_act = [1] * 8
         self._legal_act = [1] * 8
 
         # 自己维护的指标 用于reward构造
@@ -122,9 +139,12 @@ class Preprocessor:
         # 里程碑奖励
         self.first_charge_reward = False
 
-        # 维护最近3个时间段内的位置
-        self.last_pos_queue = deque(maxlen=3)
+        # 探索统计窗口
+        self.last_pos_queue = deque(maxlen=4)
         self.loop_pos = 0.0
+        self.unique_pos_ratio_6 = 1.0
+        self.net_displacement_10 = 0.0
+        self.new_cell_count_10 = 0.0
 
         # npc 位置
         self.npc_positions = []
@@ -163,7 +183,7 @@ class Preprocessor:
         self._update_loop_pos(self.cur_pos)
 
         # Legal actions / 合法动作
-        self._legal_act = [int(x) for x in (observation.get("legal_action") or [1] * 8)]
+        self._raw_legal_act = self._get_raw_legal_action(observation)
 
         # Local view map (21×21) / 局部视野地图
         map_info = observation.get("map_info")
@@ -174,14 +194,111 @@ class Preprocessor:
 
         self._update_charger_state(organs)
         self._update_npc_state(self.cur_pos, frame_state.get("npcs") or [])
+        self._legal_act = self._refine_legal_action(self._raw_legal_act)
+
+    def _get_raw_legal_action(self, observation):
+        """Load raw legal action from env observation.
+
+        从 observation 中读取 legal_act；若缺失则回退为全 1。
+        """
+        legal_action = observation.get("legal_act")
+
+        if legal_action is None:
+            return [1] * 8
+
+        legal_action = [int(x) for x in legal_action]
+        if len(legal_action) != 8:
+            return [1] * 8
+        return legal_action
+
+    def _is_passable_value(self, value):
+        """Check whether map cell value is passable.
+
+        判断地图格子是否可通行：道路/污渍/充电桩可通行。
+        """
+        return int(value) in (self.MAP_ROAD, self.MAP_DIRT, self.MAP_CHARGER)
+
+    def _is_charger_value(self, value):
+        """Check whether map cell value is charger.
+
+        判断地图格子是否为充电桩。
+        """
+        return int(value) == self.MAP_CHARGER
+
+    def _is_step_passable(self, gx, gz):
+        """Check one-step target passability from local map first.
+
+        优先使用局部视野判断一步落点可通行性；视野异常时回退到 passable_map。
+        """
+        hx, hz = self.cur_pos
+        view_value = self._get_view_cell(gx, gz, hx, hz)
+        if self._view_map is not None:
+            view_h, view_w = self._view_map.shape[:2]
+            center_x = view_h // 2
+            center_z = view_w // 2
+            view_x = gx - hx + center_x
+            view_z = gz - hz + center_z
+            if 0 <= view_x < view_h and 0 <= view_z < view_w:
+                return self._is_passable_value(view_value)
+
+        if not (0 <= gx < self.GRID_SIZE and 0 <= gz < self.GRID_SIZE):
+            return False
+        return self._is_passable_value(self.passable_map[gx, gz])
+
+    def _build_local_move_legal_action(self):
+        """Build one-step executable action mask from local geometry.
+
+        根据当前位置周围一步几何关系，构造真实可执行动作掩码。
+        """
+        hx, hz = self.cur_pos
+        legal = []
+        for dx, dz in self.ACTION_DIRS_8:
+            tx, tz = hx + dx, hz + dz
+            target_ok = self._is_step_passable(tx, tz)
+            if not target_ok:
+                legal.append(0)
+                continue
+
+            if dx != 0 and dz != 0:
+                side1_ok = self._is_step_passable(hx + dx, hz)
+                side2_ok = self._is_step_passable(hx, hz + dz)
+                legal.append(1 if (side1_ok or side2_ok) else 0)
+            else:
+                legal.append(1)
+        return legal
+
+    def _refine_legal_action(self, raw_legal_action):
+        """Intersect env legal action and local executable action.
+
+        将环境原始动作列表与本地一步真实可行动作做交集，并保证不返回全 0。
+        """
+        local_legal = self._build_local_move_legal_action()
+        refined = [int(bool(raw)) * int(bool(local)) for raw, local in zip(raw_legal_action, local_legal)]
+
+        if sum(refined) > 0:
+            return refined
+        if sum(raw_legal_action) > 0:
+            return list(raw_legal_action)
+        if sum(local_legal) > 0:
+            return local_legal
+        return [1] * 8
 
     def _update_loop_pos(self, cur_pos):
         """Update loop position.
 
         更新循环位置。
         """
-        # 计算当前位置在最近历史窗口中重复出现的次数
-        self.loop_pos = float(sum(1 for pos in self.last_pos_queue if pos == cur_pos))
+        recent_positions = list(self.last_pos_queue) + [cur_pos]
+        if len(recent_positions) >= 4:
+            p0, p1, p2, p3 = recent_positions[-4:]
+            self.loop_pos = 1.0 if (p0 == p2 and p1 == p3 and p0 != p1) else 0.0
+        else:
+            self.loop_pos = 0.0
+
+        # 旧监控字段保留默认值，不再驱动探索奖励
+        self.unique_pos_ratio_6 = 1.0
+        self.net_displacement_10 = 0.0
+        self.new_cell_count_10 = 0.0
         self.last_pos_queue.append(cur_pos)
 
 
@@ -207,7 +324,7 @@ class Preprocessor:
             self.charger_positions = charger_positions
             self.total_charger = max(self.total_charger, len(charger_positions))
             for x, z in charger_positions:
-                self.passable_map[x, z] = 3
+                self.passable_map[x, z] = self.MAP_CHARGER
 
         self.last_charging = self.charging
         self.charging = self.cur_pos in self.charger_positions
@@ -239,8 +356,8 @@ class Preprocessor:
             ]))
         else:
             npc_distance = 200.0
-        # 只有当距离npc为2个格子的时候，才认为是距离npc过近了 给reward用
-        self.close_npc_state = npc_distance < 5.0 and npc_distance < self.last_npc_distance
+        # 只有当距离npc为3个格子的时候，才认为是距离npc过近了 给reward用
+        self.close_npc_state = npc_distance < 3.0 and npc_distance < self.last_npc_distance
         self.last_npc_distance = npc_distance
 
 
@@ -252,9 +369,9 @@ class Preprocessor:
         return None
 
     def _update_passable(self, hx, hz):
-        """Write local view into global passable map.
+        """Write local view into global map memory.
 
-        将局部视野写入全局通行地图。
+        将局部视野写入全局地图记忆。
         """
         view = self._view_map
         vsize = view.shape[0]
@@ -265,9 +382,13 @@ class Preprocessor:
                 gx = hx - half + ri
                 gz = hz - half + ci
                 if 0 <= gx < self.GRID_SIZE and 0 <= gz < self.GRID_SIZE:
-                    # 0 = obstacle, 1 = passable, 3 = charger
-                    # 0 = 障碍, 1 = 可通行, 3 = 充电桩
-                    self.passable_map[gx, gz] = 1 if view[ri, ci] != 0 else 0
+                    cell_value = int(view[ri, ci])
+                    if cell_value == self.MAP_OBSTACLE:
+                        self.passable_map[gx, gz] = self.MAP_OBSTACLE
+                    elif cell_value == self.MAP_ROAD:
+                        self.passable_map[gx, gz] = self.MAP_ROAD
+                    elif cell_value == self.MAP_DIRT:
+                        self.passable_map[gx, gz] = self.MAP_DIRT
 
     def _get_local_view_feature(self):
         """Local view feature: crop center 15×15 from 21×21.
@@ -352,7 +473,7 @@ class Preprocessor:
                 z = hz + dz * step
                 if not (0 <= x < self.GRID_SIZE and 0 <= z < self.GRID_SIZE):
                     break
-                if self.passable_map[x, z] == 3:
+                if self._is_charger_value(self.passable_map[x, z]):
                     found = step
                     break
             ray_charge.append(_norm(found, max_ray))
@@ -564,6 +685,9 @@ class Preprocessor:
         context.first_charge_reward = self.first_charge_reward
         context.charge_count = self.charge_count
         context.loop_pos = self.loop_pos
+        context.unique_pos_ratio_6 = self.unique_pos_ratio_6
+        context.net_displacement_10 = self.net_displacement_10
+        context.new_cell_count_10 = self.new_cell_count_10
         context.close_npc_state = self.close_npc_state
 
         return context

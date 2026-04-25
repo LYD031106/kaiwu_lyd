@@ -14,16 +14,16 @@ class RewardCharge:
         # 分阶段当电量在 30 以上 不会施加任何奖励 适当进行惩罚
         charge_ratio = context.battery / context.battery_max
         moving_towards_charge = context.charge_dis_delta > 0
-        if context.battery >= 30:
+        if charge_ratio >= 0.2:
             # 适当进行惩罚
             if context.charging:
                 reward -= 0.2
-        elif context.battery < 30 and context.battery > 15:
+        elif charge_ratio >= 0.1 and charge_ratio < 0.2:
             if moving_towards_charge:
                 reward += 0.2
             else :
                 reward -= 0.2
-        elif context.battery < 15:
+        elif charge_ratio < 0.1:
             if moving_towards_charge:
                 reward += 0.4
             else :

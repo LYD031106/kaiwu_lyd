@@ -1,7 +1,7 @@
 [env_conf]
 # Maps used for training. Customize by keeping only desired map IDs, e.g. [1, 2] for maps 1 and 2.
 # 训练使用的地图。可自定义选择期望用来训练的地图，如只期望使用1、2号地图训练数组内仅保留[1,2]即可。
-map = [6,7,8]
+map = [6]
 
 # Whether to randomly select maps. Boolean. 
 # true = randomly pick one from configured maps per episode, false = used sequentially.
@@ -23,4 +23,4 @@ max_step = 1000
 
 # Maximum battery. The battery level when fully charged. Range: 100~999.
 # 最大电量。满电状态下的电量。可配置范围100～999。
-battery_max = 200
+battery_max = 150

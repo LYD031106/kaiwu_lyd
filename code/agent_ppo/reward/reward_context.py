@@ -44,6 +44,9 @@ class RewardContext:
         self.visit = np.zeros((self.GRID_SIZE, self.GRID_SIZE), dtype=np.int8)
         self.dur_visit = np.zeros((3, 3), dtype=np.int8)
         self.dirt_delta = 0.0
+        self.unique_pos_ratio_6 = 1.0
+        self.net_displacement_10 = 0.0
+        self.new_cell_count_10 = 0.0
 
         # 充电字段
         self.charge_distance = 200.0
