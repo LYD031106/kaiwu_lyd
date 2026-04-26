@@ -18,6 +18,7 @@ from agent_ppo.reward.reward_clean import RewardClean
 from agent_ppo.reward.reward_context import RewardContext
 from agent_ppo.reward.reward_explore import RewardExplore
 from agent_ppo.reward.reward_npc import RewardNpc
+from agent_ppo.feature.utilis import shortest_path_to_any
 
 
 def _norm(v, v_max, v_min=0.0):
@@ -66,6 +67,7 @@ class Preprocessor:
         (0, 1),
         (1, 1),
     ]
+    PATH_PASSABLE_STATUS = (MAP_ROAD, MAP_DIRT, MAP_CHARGER)
 
     def __init__(self):
         self.reset()
@@ -100,6 +102,8 @@ class Preprocessor:
         self._view_map = np.zeros((21, 21), dtype=np.float32)
         self._raw_legal_act = [1] * 8
         self._legal_act = [1] * 8
+        self._local_legal_act = [1] * 8
+        self._legal_debug_reason = "init"
 
         # 自己维护的指标 用于reward构造
         # 最近的充电桩距离
@@ -273,15 +277,72 @@ class Preprocessor:
         将环境原始动作列表与本地一步真实可行动作做交集，并保证不返回全 0。
         """
         local_legal = self._build_local_move_legal_action()
+        self._local_legal_act = list(local_legal)
         refined = [int(bool(raw)) * int(bool(local)) for raw, local in zip(raw_legal_action, local_legal)]
 
         if sum(refined) > 0:
+            self._legal_debug_reason = "intersection"
             return refined
         if sum(raw_legal_action) > 0:
+            self._legal_debug_reason = "fallback_raw"
             return list(raw_legal_action)
         if sum(local_legal) > 0:
+            self._legal_debug_reason = "fallback_local"
             return local_legal
+        self._legal_debug_reason = "fallback_all_one"
         return [1] * 8
+
+    def get_legal_debug_info(self):
+        """Return lightweight debug info for legal action refinement.
+
+        返回合法动作裁剪的轻量调试信息。
+        """
+        center_window = []
+        if self._view_map is not None:
+            view_h, view_w = self._view_map.shape[:2]
+            center_x = view_h // 2
+            center_z = view_w // 2
+            x0 = max(center_x - 2, 0)
+            x1 = min(center_x + 3, view_h)
+            z0 = max(center_z - 2, 0)
+            z1 = min(center_z + 3, view_w)
+            center_window = np.asarray(self._view_map[x0:x1, z0:z1], dtype=np.int32).tolist()
+
+        move_checks = []
+        hx, hz = self.cur_pos
+        for idx, (dx, dz) in enumerate(self.ACTION_DIRS_8):
+            tx, tz = hx + dx, hz + dz
+            target_value = self._get_view_cell(tx, tz, hx, hz)
+            target_ok = self._is_step_passable(tx, tz)
+            item = {
+                "idx": int(idx),
+                "dir": [int(dx), int(dz)],
+                "target": [int(tx), int(tz)],
+                "target_value": int(target_value),
+                "target_ok": bool(target_ok),
+            }
+            if dx != 0 and dz != 0:
+                side1 = (hx + dx, hz)
+                side2 = (hx, hz + dz)
+                item["side1"] = [int(side1[0]), int(side1[1])]
+                item["side2"] = [int(side2[0]), int(side2[1])]
+                item["side1_value"] = int(self._get_view_cell(side1[0], side1[1], hx, hz))
+                item["side2_value"] = int(self._get_view_cell(side2[0], side2[1], hx, hz))
+                item["side1_ok"] = bool(self._is_step_passable(side1[0], side1[1]))
+                item["side2_ok"] = bool(self._is_step_passable(side2[0], side2[1]))
+            move_checks.append(item)
+
+        return {
+            "step_no": int(self.step_no),
+            "cur_pos": tuple(self.cur_pos),
+            "raw": list(self._raw_legal_act),
+            "local": list(self._local_legal_act),
+            "refined": list(self._legal_act),
+            "reason": self._legal_debug_reason,
+            "loop_pos": float(self.loop_pos),
+            "center_window": center_window,
+            "move_checks": move_checks,
+        }
 
     def _update_loop_pos(self, cur_pos):
         """Update loop position.
@@ -361,12 +422,58 @@ class Preprocessor:
         self.last_npc_distance = npc_distance
 
 
-    def _get_nearest_dir(self):
-        """Placeholder for nearest-direction helper.
+    def _get_path_to_targets(self, target_positions):
+        """Find shortest path result to nearest target position.
 
-        最近方向辅助函数预留接口。
+        对一组目标坐标求最近目标的最短路结果。
         """
-        return None
+        if not target_positions:
+            return {
+                "found": False,
+                "target_pos": None,
+                "distance": -1,
+                "path": [],
+                "first_step": None,
+            }
+
+        try:
+            return shortest_path_to_any(
+                cur_pos=self.cur_pos,
+                status_map=self.passable_map,
+                target_positions=target_positions,
+                passable_status=self.PATH_PASSABLE_STATUS,
+                allow_diagonal=False,
+            )
+        except Exception:
+            return {
+                "found": False,
+                "target_pos": None,
+                "distance": -1,
+                "path": [],
+                "first_step": None,
+            }
+
+    def _get_path_to_status(self, target_status):
+        """Find shortest path result to nearest target status.
+
+        对某个目标 status 求最近目标的最短路结果。
+        """
+        try:
+            return shortest_path_to_any(
+                cur_pos=self.cur_pos,
+                status_map=self.passable_map,
+                target_positions=np.argwhere(self.passable_map == target_status).tolist(),
+                passable_status=self.PATH_PASSABLE_STATUS,
+                allow_diagonal=False,
+            )
+        except Exception:
+            return {
+                "found": False,
+                "target_pos": None,
+                "distance": -1,
+                "path": [],
+                "first_step": None,
+            }
 
     def _update_passable(self, hx, hz):
         """Write local view into global map memory.
@@ -511,9 +618,22 @@ class Preprocessor:
         if not target_positions:
             return direction
 
-        cur = np.array(self.cur_pos, dtype=np.float32)
-        target = min(target_positions, key=lambda pos: (pos[0] - self.cur_pos[0]) ** 2 + (pos[1] - self.cur_pos[1]) ** 2)
-        vec = np.array([target[0] - cur[0], target[1] - cur[1]], dtype=np.float32)
+        path_result = self._get_path_to_targets(target_positions)
+
+        if path_result.get("found") and path_result.get("first_step") is not None:
+            next_pos = path_result["first_step"]
+            vec = np.array(
+                [next_pos[0] - self.cur_pos[0], next_pos[1] - self.cur_pos[1]],
+                dtype=np.float32,
+            )
+        else:
+            cur = np.array(self.cur_pos, dtype=np.float32)
+            target = min(
+                target_positions,
+                key=lambda pos: (pos[0] - self.cur_pos[0]) ** 2 + (pos[1] - self.cur_pos[1]) ** 2,
+            )
+            vec = np.array([target[0] - cur[0], target[1] - cur[1]], dtype=np.float32)
+
         norm = np.linalg.norm(vec)
         if norm <= 1e-6:
             direction.fill(1.0 / 8.0)
@@ -538,12 +658,17 @@ class Preprocessor:
         return scores / score_sum
 
     def _calc_nearest_charge_dist(self):
-        """Find nearest charger Euclidean distance from cached charger positions.
+        """Find nearest charger path distance from global map memory.
 
-        从已缓存的充电桩坐标中找最近充电桩的欧氏距离。
+        基于全局地图记忆，优先使用最短路估计最近充电桩距离；不可达时回退直线距离。
         """
         if not self.charger_positions:
             return 200.0
+
+        path_result = self._get_path_to_targets(self.charger_positions)
+        if path_result.get("found"):
+            return float(path_result["distance"])
+
         cur = np.array(self.cur_pos, dtype=np.float32)
         charger_coords = np.array(self.charger_positions, dtype=np.float32)
         dists = np.sqrt(np.sum((charger_coords - cur) ** 2, axis=1))
@@ -587,13 +712,13 @@ class Preprocessor:
         # 8-directional rays for dirt / 污渍八方向射线距离
         ray_dirt = self._calc_ray_dirt_features(hx, hz)
 
-        # Nearest dirt Euclidean distance (estimated from cropped local view)
-        # 最近污渍欧氏距离（基于裁剪后的局部视野粗估）
+        # Nearest dirt path distance (estimated from map memory)
+        # 最近污渍最短路距离（基于地图记忆估计）
         nearest_dirt_norm, dirt_delta = self._update_nearest_dirt_metrics()
 
 
-        # Nearest charge Euclidean distance (estimated from global map)
-        # 最近充电桩欧氏距离（基于全局地图粗估）
+        # Nearest charge path distance (estimated from global map memory)
+        # 最近充电桩最短路距离（基于全局地图记忆估计）
         self._update_nearest_charge_metrics()
         nearest_charge_norm = _norm(self.charge_distance, self.TARGET_MAX_DIST)
         charge_delta = 1.0 if self.charge_dis_delta > 0 else 0.0
@@ -628,14 +753,18 @@ class Preprocessor:
         )
 
     def _calc_nearest_dirt_dist(self):
-        """Find nearest dirt Euclidean distance from local view.
+        """Find nearest dirt path distance from map memory.
 
-        从局部视野中找最近污渍的欧氏距离。
+        基于地图记忆估计最近污渍最短路；不可达时回退到局部视野直线距离。
         """
+        path_result = self._get_path_to_status(self.MAP_DIRT)
+        if path_result.get("found"):
+            return float(path_result["distance"])
+
         view = self._view_map
         if view is None:
             return 200.0
-        dirt_coords = np.argwhere(view == 2)
+        dirt_coords = np.argwhere(view == self.MAP_DIRT)
         if len(dirt_coords) == 0:
             return 200.0
         center_x = view.shape[0] // 2

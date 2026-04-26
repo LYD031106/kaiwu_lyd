@@ -62,6 +62,26 @@ class Agent(BaseAgent):
         feature, legal_action, reward = self.preprocessor.feature_process(env_obs, self.last_action)
         self.last_reward = reward
 
+        if self.logger is not None:
+            debug_info = self.preprocessor.get_legal_debug_info()
+            raw = debug_info["raw"]
+            local = debug_info["local"]
+            refined = debug_info["refined"]
+            should_log = (
+                debug_info["step_no"] <= 20
+                or raw != refined
+                or local != refined
+                or debug_info["reason"] != "intersection"
+            )
+            if should_log:
+                self.logger.info(
+                    "legal_action_debug "
+                    f"step={debug_info['step_no']} pos={debug_info['cur_pos']} "
+                    f"reason={debug_info['reason']} raw={raw} local={local} refined={refined} "
+                    f"last_action={self.last_action} loop_pos={debug_info['loop_pos']} "
+                    f"center5x5={debug_info['center_window']} move_checks={debug_info['move_checks']}"
+                )
+
         obs_data = ObsData(
             feature=list(feature),
             legal_action=legal_action,

@@ -28,6 +28,14 @@ DIRS_8 = [
 ]
 
 
+def _is_diagonal_move(dx, dz):
+    """Check whether move is diagonal.
+
+    判断是否为斜向移动。
+    """
+    return dx != 0 and dz != 0
+
+
 def _to_tuple(pos):
     """Convert position to int tuple (x, z).
 
@@ -60,6 +68,94 @@ def _build_blocked_mask(status_map, passable_status=None):
 
     passable_set = set(passable_status)
     return ~np.isin(status_map, list(passable_set))
+
+
+def _can_step(blocked, x, z, nx, nz, rows, cols, allow_diagonal):
+    """Check whether one move is executable.
+
+    判断单步移动是否合法；斜向移动时避免穿角。
+    """
+    if not _in_bounds(nx, nz, rows, cols):
+        return False
+    if blocked[nx, nz]:
+        return False
+
+    dx = nx - x
+    dz = nz - z
+    if allow_diagonal and _is_diagonal_move(dx, dz):
+        side1 = (x + dx, z)
+        side2 = (x, z + dz)
+        side1_ok = _in_bounds(side1[0], side1[1], rows, cols) and not blocked[side1[0], side1[1]]
+        side2_ok = _in_bounds(side2[0], side2[1], rows, cols) and not blocked[side2[0], side2[1]]
+        if not (side1_ok or side2_ok):
+            return False
+    return True
+
+
+def _nearest_target_path_result(start, status_map, blocked, target_mask, allow_diagonal=False):
+    """Run BFS and return nearest target path result.
+
+    执行 BFS，返回最近目标及其路径信息。
+    """
+    rows, cols = status_map.shape
+    if blocked[start[0], start[1]]:
+        return {
+            "found": False,
+            "target_pos": None,
+            "distance": -1,
+            "path": [],
+            "first_step": None,
+        }
+
+    if target_mask[start[0], start[1]]:
+        return {
+            "found": True,
+            "target_pos": start,
+            "distance": 0,
+            "path": [start],
+            "first_step": None,
+        }
+
+    dirs = DIRS_8 if allow_diagonal else DIRS_4
+    queue = deque([start])
+    visited = {start}
+    parent = {start: None}
+    distance = {start: 0}
+
+    while queue:
+        x, z = queue.popleft()
+        for dx, dz in dirs:
+            nx, nz = x + dx, z + dz
+            nxt = (nx, nz)
+            if nxt in visited:
+                continue
+            if not _can_step(blocked, x, z, nx, nz, rows, cols, allow_diagonal):
+                continue
+
+            visited.add(nxt)
+            parent[nxt] = (x, z)
+            distance[nxt] = distance[(x, z)] + 1
+
+            if target_mask[nx, nz]:
+                path = reconstruct_path(parent, nxt)
+                first_step = path[1] if len(path) > 1 else None
+                return {
+                    "found": True,
+                    "target_pos": nxt,
+                    "distance": distance[nxt],
+                    "path": path,
+                    "first_step": first_step,
+                }
+
+            queue.append(nxt)
+
+    return {
+        "found": False,
+        "target_pos": None,
+        "distance": -1,
+        "path": [],
+        "first_step": None,
+    }
 
 
 def reconstruct_path(parent, end_pos):
@@ -111,58 +207,14 @@ def shortest_path_to_status(
         raise ValueError("cur_pos is out of map bounds")
 
     blocked = _build_blocked_mask(status_map, passable_status=passable_status)
-    if blocked[start[0], start[1]]:
-        return {
-            "found": False,
-            "target_pos": None,
-            "distance": -1,
-            "path": [],
-        }
-
-    if status_map[start[0], start[1]] == target_status:
-        return {
-            "found": True,
-            "target_pos": start,
-            "distance": 0,
-            "path": [start],
-        }
-
-    dirs = DIRS_8 if allow_diagonal else DIRS_4
-    queue = deque([start])
-    visited = {start}
-    parent = {start: None}
-    distance = {start: 0}
-
-    while queue:
-        x, z = queue.popleft()
-        for dx, dz in dirs:
-            nx, nz = x + dx, z + dz
-            nxt = (nx, nz)
-            if not _in_bounds(nx, nz, rows, cols):
-                continue
-            if nxt in visited or blocked[nx, nz]:
-                continue
-
-            visited.add(nxt)
-            parent[nxt] = (x, z)
-            distance[nxt] = distance[(x, z)] + 1
-
-            if status_map[nx, nz] == target_status:
-                return {
-                    "found": True,
-                    "target_pos": nxt,
-                    "distance": distance[nxt],
-                    "path": reconstruct_path(parent, nxt),
-                }
-
-            queue.append(nxt)
-
-    return {
-        "found": False,
-        "target_pos": None,
-        "distance": -1,
-        "path": [],
-    }
+    target_mask = status_map == target_status
+    return _nearest_target_path_result(
+        start=start,
+        status_map=status_map,
+        blocked=blocked,
+        target_mask=target_mask,
+        allow_diagonal=allow_diagonal,
+    )
 
 
 def shortest_distance_to_status(
@@ -184,3 +236,48 @@ def shortest_distance_to_status(
         allow_diagonal=allow_diagonal,
     )
     return result["distance"]
+
+
+def shortest_path_to_any(
+    cur_pos,
+    status_map,
+    target_positions,
+    passable_status=None,
+    allow_diagonal=False,
+):
+    """Find shortest path from current position to nearest target position.
+
+    从当前位置出发，找到最近的目标坐标，并返回最短路径。
+    """
+    status_map = np.asarray(status_map)
+    if status_map.ndim != 2:
+        raise ValueError("status_map must be a 2D array")
+
+    rows, cols = status_map.shape
+    start = _to_tuple(cur_pos)
+    if not _in_bounds(start[0], start[1], rows, cols):
+        raise ValueError("cur_pos is out of map bounds")
+
+    target_mask = np.zeros((rows, cols), dtype=bool)
+    for pos in target_positions or []:
+        tx, tz = _to_tuple(pos)
+        if _in_bounds(tx, tz, rows, cols):
+            target_mask[tx, tz] = True
+
+    if not np.any(target_mask):
+        return {
+            "found": False,
+            "target_pos": None,
+            "distance": -1,
+            "path": [],
+            "first_step": None,
+        }
+
+    blocked = _build_blocked_mask(status_map, passable_status=passable_status)
+    return _nearest_target_path_result(
+        start=start,
+        status_map=status_map,
+        blocked=blocked,
+        target_mask=target_mask,
+        allow_diagonal=allow_diagonal,
+    )
